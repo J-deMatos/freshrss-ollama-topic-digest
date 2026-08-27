@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.4 - 2026-08-27
+
+- Clarify that the project is exploratory and intended for personal FreshRSS
+  setups.
+
 ## 0.3.3 - 2026-08-27
 
 - Promote the Topic Digests category directly below Favourites in the sidebar.

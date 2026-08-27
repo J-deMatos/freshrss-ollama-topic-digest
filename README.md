@@ -4,6 +4,13 @@ A per-user FreshRSS extension that organises matching news using a local Ollama
 service. Each topic can be a low-priority living digest or a high-priority feed
 of normal FreshRSS articles.
 
+## Project status
+
+This is an exploratory project for personal FreshRSS setups. Expect changes as
+the matching rules and interface improve. Back up your FreshRSS data before
+trying it on an important installation, and treat the results as suggestions
+to review rather than authoritative news.
+
 ## Requirements
 
 - FreshRSS with PHP 8.1 or newer and SQLite PDO support

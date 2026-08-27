@@ -1,6 +1,20 @@
 /* globals context */
 (() => {
 	'use strict';
+	const ensureMarker = (title, emoji, label) => {
+		if (!title) return;
+		let marker = title.querySelector('[data-topic-digest-marker]');
+		if (!marker) {
+			marker = document.createElement('span');
+			marker.className = 'topic-digest-sidebar-marker';
+			marker.dataset.topicDigestMarker = '1';
+			title.prepend(marker);
+		}
+		marker.textContent = emoji;
+		marker.title = label;
+		marker.setAttribute('role', 'img');
+		marker.setAttribute('aria-label', label);
+	};
 	const applyTopicCounts = (counts) => {
 		if (!counts || typeof counts !== 'object') return;
 		for (const [feedId, rawCount] of Object.entries(counts)) {
@@ -32,6 +46,11 @@
 		const link = Array.from(category?.children || [])
 			.find((child) => child.matches?.('a.tree-folder-title'));
 		if (!link) return;
+		ensureMarker(link.querySelector(':scope > .title'), '🧭', 'Topic Digests');
+		const favorites = document.querySelector('#sidebar > .tree-folder.favorites');
+		if (favorites?.parentElement === category.parentElement && favorites.nextElementSibling !== category) {
+			favorites.parentElement.insertBefore(category, favorites.nextElementSibling);
+		}
 
 		const url = new URL(link.href, window.location.href);
 		url.searchParams.set('state', String(allState));
@@ -42,9 +61,11 @@
 		for (const feedId of Object.keys(settings.feed_counts || {})) {
 			const feed = document.getElementById(`f_${feedId}`);
 			if (!feed) continue;
+			const isLowPriority = (feedTypes[feedId] || 'digest') === 'digest';
+			ensureMarker(feed.querySelector(':scope > .item-title > .title'), isLowPriority ? '🗂️' : '⚡',
+				isLowPriority ? 'Low-priority living digest' : 'High-priority topic feed');
 			feed.classList.toggle('topic-digest-always-visible', alwaysShowTopics);
 			if (!alwaysShowTopics) continue;
-			const isLowPriority = (feedTypes[feedId] || 'digest') === 'digest';
 			activeLowPriorityTopic ||= isLowPriority && feed.classList.contains('active');
 			const feedLink = Array.from(feed.children).find((child) => child.matches?.('a.item-title'));
 			if (feedLink && isLowPriority) {

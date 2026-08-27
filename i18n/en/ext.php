@@ -21,8 +21,8 @@ return [
 		'edit_topic' => 'Edit topic',
 		'name' => 'Name',
 		'topic_type' => 'Topic priority and presentation',
-		'topic_type_digest' => 'Low priority — one living digest entry',
-		'topic_type_feed' => 'High priority — overview and normal article list',
+		'topic_type_digest' => '🗂️ Low priority — one living digest entry',
+		'topic_type_feed' => '⚡ High priority — overview and normal article list',
 		'topic_type_help' => 'Low priority collects matches into one event-grouped entry. High priority creates one '
 			. 'living overview followed by one normal unread FreshRSS entry per matched source.',
 		'description' => 'What belongs in this topic?',

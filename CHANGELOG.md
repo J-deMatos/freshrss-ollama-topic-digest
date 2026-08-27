@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.3 - 2026-08-27
+
+- Promote the Topic Digests category directly below Favourites in the sidebar.
+- Add informative navigation markers for the category, low-priority digests,
+  and high-priority topic feeds without changing stored names.
+
 ## 0.3.2 - 2026-08-27
 
 - Order digest events by their effective event date rather than the date of the

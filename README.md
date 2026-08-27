@@ -66,6 +66,11 @@ excluded from the main stream, network refresh, archive scanning, and matching.
 Changing presentation replaces only extension-owned generated objects and
 preserves the topic rule and its source memberships.
 
+For prominence, the extension places **🧭 Topic Digests** directly below
+Favourites in the sidebar. Topic feeds use **🗂️** for low priority and **⚡** for
+high priority. These are interface markers only; stored category and feed names
+remain unchanged.
+
 ## Matching behaviour
 
 Each topic has an inclusion description, explicit exclusions, confidence,

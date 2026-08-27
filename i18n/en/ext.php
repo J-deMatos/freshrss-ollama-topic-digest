@@ -22,17 +22,17 @@ return [
 		'name' => 'Name',
 		'topic_type' => 'Topic priority and presentation',
 		'topic_type_digest' => 'Low priority — one living digest entry',
-		'topic_type_feed' => 'High priority — normal article list',
+		'topic_type_feed' => 'High priority — overview and normal article list',
 		'topic_type_help' => 'Low priority collects matches into one event-grouped entry. High priority creates one '
-			. 'normal unread FreshRSS entry per matched source in the topic feed.',
+			. 'living overview followed by one normal unread FreshRSS entry per matched source.',
 		'description' => 'What belongs in this topic?',
 		'description_help' => 'Describe concrete events to include. This text is also shown in the synthetic feed.',
 		'exclusions' => 'Exclusions',
 		'exclusions_help' => 'One exclusion per line. Restored items can propose additions here.',
 		'feed_behaviour' => 'Matching source articles are marked read. Restore returns a source to the unread stream '
 			. 'and proposes an exclusion for approval; the written rule is never changed automatically.',
-		'high_priority_feed_behaviour' => 'Each match appears as a normal unread article in this topic feed. The original '
-			. 'source entry is marked read only after the topic copy is stored successfully.',
+		'high_priority_feed_behaviour' => 'A living event overview stays first, followed by each match as a normal unread '
+			. 'article. The original source is marked read only after the topic copy and overview are stored successfully.',
 		'restore' => 'Restore',
 		'restore_all' => 'Restore all',
 		'why_matched' => 'Why it matched',

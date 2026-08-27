@@ -88,10 +88,9 @@ final class TopicDigestExtension extends Minz_Extension {
 				$feedId = (int)($topic['feed_id'] ?? 0);
 				$entryId = (string)($topic['entry_id'] ?? '');
 				$feed = $feedId > 0 ? $feedDao->searchById($feedId) : null;
-				$digestEntryMissing = $topic['topic_type'] === 'digest'
-					&& ($entryId === '' || $entryDao->searchById($entryId) === null);
+				$overviewEntryMissing = $entryId === '' || $entryDao->searchById($entryId) === null;
 				$feedTopicAttributes = $feed?->attributeArray('topic_digest') ?? [];
-				if ($feedId < 1 || $feed === null || $digestEntryMissing
+				if ($feedId < 1 || $feed === null || $overviewEntryMissing
 						|| $feed->priority() !== FreshRSS_Feed::PRIORITY_CATEGORY
 						|| ($feedTopicAttributes['topic_type'] ?? null) !== $topic['topic_type']) {
 					$this->synchroniseTopic((int)$topic['id'], false);
@@ -282,7 +281,11 @@ final class TopicDigestExtension extends Minz_Extension {
 		$description = $this->feedDescription($topic);
 		$feedTopicAttributes = $feed?->attributeArray('topic_digest') ?? [];
 		$currentType = (string)($feedTopicAttributes['topic_type'] ?? 'digest');
+		$preservedOverview = null;
 		if ($feed !== null && $currentType !== $topic['topic_type']) {
+			$preservedOverview = FreshRSS_Factory::createEntryDao()->searchByGuid(
+				$feed->id(), $this->topicOverviewGuid($topicId)
+			);
 			if (!FreshRSS_feed_Controller::deleteFeed($feed->id())) {
 				throw new RuntimeException('Could not replace the synthetic Topic Digest feed after changing its type.');
 			}
@@ -326,39 +329,17 @@ final class TopicDigestExtension extends Minz_Extension {
 			throw new RuntimeException('Could not reload the synthetic Topic Digest feed.');
 		}
 		if ($topic['topic_type'] === 'feed') {
-			$this->synchroniseHighPriorityFeed($topic, $feedId, $prune);
-			$this->store()->attachSynthetic($topicId, $feedId, null);
+			$detachedOverview = $this->synchroniseHighPriorityFeed($topic, $feedId, $prune);
+			$overview = $this->synchroniseOverviewEntry(
+				$topic, $feedId, $markUnread, $preservedOverview ?? $detachedOverview, true
+			);
+			$this->store()->attachSynthetic($topicId, $feedId, $overview->id());
 			$feedDao->updateCachedValues($feedId);
 			FreshRSS_UserDAO::touch();
 			$this->syntheticFeedIds = null;
 			return;
 		}
-		$entryDao = FreshRSS_Factory::createEntryDao();
-		$guid = 'topic-digest:' . $topicId;
-		$entry = $entryDao->searchByGuid($feedId, $guid);
-		$events = $this->store()->events($topicId);
-		$date = $events === [] ? time() : (int)$events[0]['occurred_at'];
-		$content = $this->renderDigest($topic, false);
-		if ($entry === null) {
-			$entry = new FreshRSS_Entry($feedId, $guid, (string)$topic['name'], 'Topic Digest', $content,
-				$syntheticUrl, $date, !$markUnread, false);
-			$entry->_id(uTimeString());
-			$entry->_lastSeen(time());
-			if (!$entryDao->addEntry($entry->toArray(), false)) {
-				throw new RuntimeException('Could not create the living Topic Digest entry.');
-			}
-		} else {
-			$entry->_title((string)$topic['name']);
-			$entry->_content($content);
-			$entry->_date($date);
-			$entry->_lastModified(time());
-			if ($markUnread) {
-				$entry->_isRead(false);
-			}
-			if (!$entryDao->updateEntry($entry->toArray())) {
-				throw new RuntimeException('Could not update the living Topic Digest entry.');
-			}
-		}
+		$entry = $this->synchroniseOverviewEntry($topic, $feedId, $markUnread, $preservedOverview);
 		$this->store()->attachSynthetic($topicId, $feedId, $entry->id());
 		$feedDao->updateCachedValues($feedId);
 		FreshRSS_UserDAO::touch();
@@ -366,7 +347,7 @@ final class TopicDigestExtension extends Minz_Extension {
 	}
 
 	/** @param array<string,mixed> $topic */
-	private function synchroniseHighPriorityFeed(array $topic, int $feedId, bool $prune): void {
+	private function synchroniseHighPriorityFeed(array $topic, int $feedId, bool $prune): ?FreshRSS_Entry {
 		$entryDao = FreshRSS_Factory::createEntryDao();
 		$sourceIds = [];
 		foreach ($this->store()->events((int)$topic['id']) as $event) {
@@ -375,9 +356,14 @@ final class TopicDigestExtension extends Minz_Extension {
 			}
 		}
 		$existing = [];
+		$detachedOverview = null;
 		if ($prune) {
 			foreach ($entryDao->listWhere(type: 'f', id: $feedId, state: FreshRSS_Entry::STATE_ALL, limit: -1) as $entry) {
-				$existing[$entry->guid()] = $entry;
+				if ($entry->guid() === $this->topicOverviewGuid((int)$topic['id'])) {
+					$detachedOverview = $entry;
+				} else {
+					$existing[$entry->guid()] = $entry;
+				}
 			}
 			if ($entryDao->cleanOldEntries($feedId) === false) {
 				throw new RuntimeException('Could not reconcile the high-priority Topic Digest feed.');
@@ -387,9 +373,10 @@ final class TopicDigestExtension extends Minz_Extension {
 			$guid = $this->topicSourceGuid((int)$topic['id'], $sourceId);
 			$this->materialiseHighPriorityEntry($topic, $feedId, $sourceId, $existing[$guid] ?? null);
 		}
+		return $detachedOverview;
 	}
 
-	public function materialiseTopicSource(int $topicId, string $sourceEntryId): void {
+	public function materialiseTopicSource(int $topicId, string $sourceEntryId, bool $markOverviewUnread): void {
 		$topic = $this->store()->topic($topicId);
 		if ($topic === null || $topic['topic_type'] !== 'feed') {
 			return;
@@ -400,6 +387,8 @@ final class TopicDigestExtension extends Minz_Extension {
 			return;
 		}
 		$this->materialiseHighPriorityEntry($topic, $feedId, $sourceEntryId);
+		$overview = $this->synchroniseOverviewEntry($topic, $feedId, $markOverviewUnread, pinned: true);
+		$this->store()->attachSynthetic($topicId, $feedId, $overview->id());
 		FreshRSS_Factory::createFeedDao()->updateCachedValues($feedId);
 		FreshRSS_UserDAO::touch();
 	}
@@ -439,6 +428,67 @@ final class TopicDigestExtension extends Minz_Extension {
 
 	private function topicSourceGuid(int $topicId, string $sourceEntryId): string {
 		return 'topic-digest-source:' . $topicId . ':' . hash('sha256', $sourceEntryId);
+	}
+
+	/** @param array<string,mixed> $topic */
+	private function synchroniseOverviewEntry(array $topic, int $feedId, bool $markUnread,
+		?FreshRSS_Entry $detached = null, bool $pinned = false): FreshRSS_Entry {
+		$entryDao = FreshRSS_Factory::createEntryDao();
+		$guid = $this->topicOverviewGuid((int)$topic['id']);
+		$entry = $detached ?? $entryDao->searchByGuid($feedId, $guid);
+		$events = $this->store()->events((int)$topic['id']);
+		$date = $this->overviewDate($events, $pinned);
+		$content = $this->renderDigest($topic, false);
+		if ($entry === null) {
+			$startsUnread = $markUnread || ($pinned && $events !== []);
+			$entry = new FreshRSS_Entry($feedId, $guid, (string)$topic['name'], 'Topic Digest', $content,
+				'https://topic-digest.invalid/topic/' . $topic['id'], $date, !$startsUnread, false);
+			$entry->_id(uTimeString());
+			$entry->_lastSeen(time());
+			if (!$entryDao->addEntry($entry->toArray(), false)) {
+				throw new RuntimeException('Could not create the living Topic Digest overview entry.');
+			}
+			return $entry;
+		}
+		$entry->_title((string)$topic['name']);
+		$entry->_content($content);
+		$entry->_date($date);
+		$entry->_lastModified(time());
+		if ($markUnread) {
+			$entry->_isRead(false);
+		}
+		$values = $entry->toArray();
+		$values['id_feed'] = $feedId;
+		if ($detached !== null) {
+			if (!$entryDao->addEntry($values, false)) {
+				throw new RuntimeException('Could not restore the living Topic Digest overview entry.');
+			}
+		} elseif (!$entryDao->updateEntry($values)) {
+			throw new RuntimeException('Could not update the living Topic Digest overview entry.');
+		}
+		return $entry;
+	}
+
+	/** @param list<array<string,mixed>> $events */
+	private function overviewDate(array $events, bool $pinned): int {
+		if ($events === []) {
+			return time();
+		}
+		if (!$pinned) {
+			return (int)$events[0]['occurred_at'];
+		}
+		$newest = 0;
+		foreach ($events as $event) {
+			$newest = max($newest, (int)$event['occurred_at']);
+			foreach ($event['sources'] as $source) {
+				$newest = max($newest, (int)$source['published_at']);
+			}
+		}
+		return $newest + 1;
+	}
+
+	private function topicOverviewGuid(int $topicId): string {
+		return 'topic-digest:' . $topicId;
 	}
 
 	private function ensureCategory(): int {

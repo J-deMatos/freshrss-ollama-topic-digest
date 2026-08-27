@@ -2,7 +2,7 @@
 	"name": "Topic Digest",
 	"author": "Topic Digest contributors",
 	"description": "Organise news into living digests or normal topic feeds with a local Ollama service.",
-	"version": "0.3.0",
+	"version": "0.3.1",
 	"entrypoint": "TopicDigest",
 	"type": "user"
 }

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.1 - 2026-08-27
+
+- Pin a living event overview above the individual articles in every
+  high-priority topic feed.
+- Preserve the overview's read state during reconciliation and presentation
+  changes; only a new event marks an existing overview unread.
+
 ## 0.3.0 - 2026-08-27
 
 - Add a per-topic low-priority digest or high-priority topic-feed presentation.

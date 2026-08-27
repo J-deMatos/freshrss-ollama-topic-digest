@@ -221,7 +221,7 @@ final class TopicDigestProcessor {
 				return false;
 			}
 			if ($topic['topic_type'] === 'feed') {
-				$this->extension->materialiseTopicSource((int)$topic['id'], $entry->id());
+				$this->extension->materialiseTopicSource((int)$topic['id'], $entry->id(), $result['new_event']);
 			} else {
 				$this->extension->synchroniseTopic((int)$topic['id'], $result['new_event']);
 			}

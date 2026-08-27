@@ -56,10 +56,10 @@ Each topic has one of two presentations:
 
 - **Low priority** groups matches as dated events in one living digest entry. A
   genuinely new event marks that entry unread; extra coverage does not.
-- **High priority** creates one normal unread FreshRSS entry for every matched
-  source. These entries retain the original title, author, article content,
-  link, publication date, tags, and enclosures and can be read or favourited
-  normally.
+- **High priority** pins the same living event overview at the top, followed by
+  one normal unread FreshRSS entry for every matched source. The individual
+  entries retain the original title, author, article content, link, publication
+  date, tags, and enclosures and can be read or favourited normally.
 
 Both presentations live under the synthetic **Topic Digests** category and are
 excluded from the main stream, network refresh, archive scanning, and matching.
@@ -75,8 +75,10 @@ summaries, decisions, source memberships, and event grouping in either mode.
 The category opens all topic feeds, and an optional display setting keeps them
 visible with zero unread entries. Low-priority topics open their living entry
 even in unread-only mode; high-priority topics retain ordinary FreshRSS read
-filtering. Sidebar topic names show their aggregated source count as
-`[ number ]` alongside FreshRSS's normal unread counter.
+filtering for their individual articles. Their overview is dated just after the
+newest matched article so it remains first in the topic list. Sidebar topic names
+show their aggregated source count as `[ number ]` alongside FreshRSS's normal
+unread counter.
 
 In low-priority topics, events and their source links are ordered newest-first.
 Classification uses the topic name, inclusion description, and exclusions, and

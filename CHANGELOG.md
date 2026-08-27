@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.0 - 2026-08-27
+
+- Add a per-topic low-priority digest or high-priority topic-feed presentation.
+- Materialise high-priority matches as normal unread FreshRSS entries carrying
+  the original title, author, content, link, date, tags, and enclosures.
+- Preserve mirrored read and favourite state during reconciliation.
+- Add match-explanation and Restore controls to high-priority entries.
+- Keep high-priority feeds on normal FreshRSS unread filtering while low-priority
+  feeds continue to open their living digest in all-articles mode.
+- Safely replace generated feed contents when switching presentation type.
+- Reject in-flight results after a topic or pipeline revision changes.
+
 ## 0.2.6 - 2026-08-27
 
 - Make Restart perform a complete digest rebuild under the current topic rules.

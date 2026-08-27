@@ -108,14 +108,14 @@ final class TopicDigestProcessor {
 		}
 		foreach ($this->store->detachChangedSources($entry->id(), $entry->hash()) as $topicId) {
 			if ($this->store->topic($topicId) !== null) {
-				$this->extension->synchroniseTopic($topicId, false);
+				$this->extension->synchroniseTopic($topicId, false, true);
 			}
 		}
 		foreach ($this->store->topicIdsForSource($entry->id()) as $topicId) {
 			$membershipTopic = $this->store->topic($topicId);
 			if ($membershipTopic === null || ($membershipTopic['enabled'] && !$this->topicAccepts($membershipTopic, $job))) {
 				if ($this->store->removeSourceMembership($topicId, $entry->id()) && $membershipTopic !== null) {
-					$this->extension->synchroniseTopic($topicId, false);
+					$this->extension->synchroniseTopic($topicId, false, true);
 				}
 			}
 		}
@@ -182,12 +182,12 @@ final class TopicDigestProcessor {
 				continue;
 			}
 			$decision = $topicDecisions[(int)$topic['id']];
-			if (!$this->store->isCurrentJob($job) || $this->store->topic((int)$topic['id']) === null) {
+			if (!$this->jobUsesCurrentPipeline($job) || $this->store->topic((int)$topic['id']) === null) {
 				return false;
 			}
 			if (!$decision['matches'] || $decision['confidence'] < (float)$topic['confidence']) {
 				if ($this->store->removeSourceMembership((int)$topic['id'], $entry->id())) {
-					$this->extension->synchroniseTopic((int)$topic['id'], false);
+					$this->extension->synchroniseTopic((int)$topic['id'], false, true);
 				}
 				continue;
 			}
@@ -208,7 +208,7 @@ final class TopicDigestProcessor {
 				continue;
 			}
 			$eventId = $eventResolution['event_id'];
-			if (!$this->store->isCurrentJob($job)) {
+			if (!$this->jobUsesCurrentPipeline($job)) {
 				return false;
 			}
 			try {
@@ -220,7 +220,11 @@ final class TopicDigestProcessor {
 			if ($result === null) {
 				return false;
 			}
-			$this->extension->synchroniseTopic((int)$topic['id'], $result['new_event']);
+			if ($topic['topic_type'] === 'feed') {
+				$this->extension->materialiseTopicSource((int)$topic['id'], $entry->id());
+			} else {
+				$this->extension->synchroniseTopic((int)$topic['id'], $result['new_event']);
+			}
 			$matched = true;
 		}
 		if ($matched) {
@@ -238,6 +242,12 @@ final class TopicDigestProcessor {
 		}
 		$this->extension->finishRebuildForEntry($entry, $matched);
 		return $this->store->completeCurrent($job);
+	}
+
+	/** @param array<string,mixed> $job */
+	private function jobUsesCurrentPipeline(array $job): bool {
+		return $this->store->isCurrentJob($job)
+			&& hash_equals((string)$job['pipeline_hash'], $this->extension->pipelineHash());
 	}
 
 	/** @param array<string,mixed> $job @param list<float> $embedding @return list<array<string,mixed>> */

@@ -23,6 +23,8 @@
 		const categoryId = Number(settings?.category_id || 0);
 		const allState = Number(settings?.all_state || 0);
 		const alwaysShowTopics = settings?.always_show_topics === true;
+		const feedTypes = settings?.feed_types && typeof settings.feed_types === 'object'
+			? settings.feed_types : {};
 		if (categoryId < 1 || allState < 1) return;
 		applyTopicCounts(settings.feed_counts);
 
@@ -36,15 +38,16 @@
 		link.href = url.toString();
 		category.classList.toggle('topic-digest-always-visible', alwaysShowTopics);
 
-		let activeTopic = false;
+		let activeLowPriorityTopic = false;
 		for (const feedId of Object.keys(settings.feed_counts || {})) {
 			const feed = document.getElementById(`f_${feedId}`);
 			if (!feed) continue;
 			feed.classList.toggle('topic-digest-always-visible', alwaysShowTopics);
 			if (!alwaysShowTopics) continue;
-			activeTopic ||= feed.classList.contains('active');
+			const isLowPriority = (feedTypes[feedId] || 'digest') === 'digest';
+			activeLowPriorityTopic ||= isLowPriority && feed.classList.contains('active');
 			const feedLink = Array.from(feed.children).find((child) => child.matches?.('a.item-title'));
-			if (feedLink) {
+			if (feedLink && isLowPriority) {
 				const feedUrl = new URL(feedLink.href, window.location.href);
 				feedUrl.searchParams.set('state', String(allState));
 				feedLink.href = feedUrl.toString();
@@ -54,7 +57,8 @@
 		// A direct or bookmarked category URL without a state should behave like a click.
 		const currentUrl = new URL(window.location.href);
 		const categoryNeedsDefault = category.classList.contains('active') && !currentUrl.searchParams.has('state');
-		const alwaysShowActive = alwaysShowTopics && (category.classList.contains('active') || activeTopic)
+		const alwaysShowActive = alwaysShowTopics
+			&& (category.classList.contains('active') || activeLowPriorityTopic)
 			&& currentUrl.searchParams.get('state') !== String(allState);
 		if (categoryNeedsDefault || alwaysShowActive) {
 			currentUrl.searchParams.set('state', String(allState));

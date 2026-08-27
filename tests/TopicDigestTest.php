@@ -35,11 +35,25 @@ final class TopicDigestTest extends TestCase {
 		$topic = $this->store->topic($id);
 		self::assertSame('days', $topic['backfill_mode']);
 		self::assertSame(90, $topic['backfill_days']);
+		self::assertSame('digest', $topic['topic_type']);
 		self::assertTrue($this->store->saveTopicEmbedding($id, $topic['rule_hash'], [1.0, 0.0]));
 
 		$topic['description'] = 'Only announcements of newly available foundation models.';
 		$this->store->saveTopic($topic, $id);
 		self::assertNull($this->store->topic($id)['description_embedding']);
+	}
+
+	public function testTopicCanUseHighPriorityFeedPresentation(): void {
+		$id = $this->store->saveTopic([
+			'name' => 'Security incidents', 'description' => 'Confirmed security incidents.',
+			'enabled' => true, 'all_feeds' => true, 'topic_type' => 'feed',
+		]);
+		self::assertSame('feed', $this->store->topic($id)['topic_type']);
+
+		$topic = $this->store->topic($id);
+		$topic['topic_type'] = 'digest';
+		$this->store->saveTopic($topic, $id);
+		self::assertSame('digest', $this->store->topic($id)['topic_type']);
 	}
 
 	public function testQueueIsIdempotentAndPipelineChangesRequeue(): void {
@@ -63,6 +77,7 @@ final class TopicDigestTest extends TestCase {
 		self::assertCount(2, $this->store->events($topicId)[0]['sources']);
 		self::assertSame(2, $this->store->topic($topicId)['article_count']);
 		self::assertSame(1, $this->store->topic($topicId)['event_count']);
+		self::assertSame('It announces availability.', $this->store->source($topicId, '100')['explanation']);
 
 		self::assertSame(['100'], $this->store->restoreSource($topicId, '100'));
 		self::assertTrue($this->store->isRejected($topicId, '100'));

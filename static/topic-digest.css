@@ -8,5 +8,10 @@
 .topic-digest-status { display: grid; grid-template-columns: max-content auto; gap: .25rem 1rem; }
 .topic-digest-status dd { margin: 0; }
 .topic-digest-sidebar-count { color: var(--font-color-grey, #666); white-space: nowrap; }
+.topic-digest-high-priority-controls {
+	border-block-start: 1px solid var(--border-color, #ccc);
+	margin-block-start: 1rem;
+	padding-block-start: .5rem;
+}
 .state_unread .category.topic-digest-always-visible,
 .state_unread .feed.topic-digest-always-visible { display: list-item !important; }

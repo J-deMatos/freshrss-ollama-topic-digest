@@ -1,7 +1,8 @@
 # FreshRSS Topic Digest
 
-A per-user FreshRSS extension that moves low-priority news into living,
-event-grouped topic digests using a local Ollama service.
+A per-user FreshRSS extension that organises matching news using a local Ollama
+service. Each topic can be a low-priority living digest or a high-priority feed
+of normal FreshRSS articles.
 
 ## Requirements
 
@@ -49,30 +50,49 @@ When News Deduplicator is installed, both extensions reuse the same per-user
 article summary and embedding only when the article content and model names
 match. Neither extension has a runtime dependency on the other.
 
-## Digest behaviour
+## Topic presentations
+
+Each topic has one of two presentations:
+
+- **Low priority** groups matches as dated events in one living digest entry. A
+  genuinely new event marks that entry unread; extra coverage does not.
+- **High priority** creates one normal unread FreshRSS entry for every matched
+  source. These entries retain the original title, author, article content,
+  link, publication date, tags, and enclosures and can be read or favourited
+  normally.
+
+Both presentations live under the synthetic **Topic Digests** category and are
+excluded from the main stream, network refresh, archive scanning, and matching.
+Changing presentation replaces only extension-owned generated objects and
+preserves the topic rule and its source memberships.
+
+## Matching behaviour
 
 Each topic has an inclusion description, explicit exclusions, confidence,
-feed/category scope, and history period. Matching reports are grouped into
-events and shown in one living entry under the synthetic **Topic Digests**
-category. A genuinely new event marks the digest unread; additional coverage
-of an existing event does not.
+feed/category scope, and history period. Matching reports share revision-safe
+summaries, decisions, source memberships, and event grouping in either mode.
 
-Synthetic feeds do not appear in the main stream or participate in network
-refresh, archive scanning, or matching. The category opens all living digests,
-and an optional display setting keeps them visible in unread-only mode. Sidebar
-topic names show their aggregated source count as `[ number ]`.
+The category opens all topic feeds, and an optional display setting keeps them
+visible with zero unread entries. Low-priority topics open their living entry
+even in unread-only mode; high-priority topics retain ordinary FreshRSS read
+filtering. Sidebar topic names show their aggregated source count as
+`[ number ]` alongside FreshRSS's normal unread counter.
 
-Events and their source links are ordered newest-first. Classification uses the
-topic name, inclusion description, and exclusions, and requires direct evidence
-rather than a shared keyword. Structured requests evaluate up to eight topics
-or ten event candidates at once. Exact revision-safe decisions are cached.
+In low-priority topics, events and their source links are ordered newest-first.
+Classification uses the topic name, inclusion description, and exclusions, and
+requires direct evidence rather than a shared keyword. Structured requests
+evaluate up to eight topics or ten event candidates at once. Exact revision-safe
+decisions are cached.
 
 ## Restore and rebuild
 
-Matching source articles are marked read only after the digest update succeeds.
+Matching source articles are marked read only after the living digest or
+high-priority topic copy is persisted successfully.
 Favourites and explicit manual-unread choices remain protected. **Restore** and
 **Restore all** return sources to the normal unread stream and create a pending
 exclusion suggestion; topic rules change only after user approval.
+High-priority entries expose their stored match explanation and a **Restore**
+control after the original article body.
 
 **Restart and rebuild Topic Digest** immediately clears generated memberships,
 retains reusable summaries and user-authored rules, and reclassifies retained

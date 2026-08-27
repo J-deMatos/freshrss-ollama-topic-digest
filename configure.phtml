@@ -7,6 +7,7 @@
 		'id' => 0, 'name' => '', 'description' => '', 'exclusions' => [], 'enabled' => true,
 		'confidence' => 0.85, 'all_feeds' => true, 'all_categories' => false,
 		'feed_ids' => [], 'category_ids' => [], 'backfill_mode' => 'days', 'backfill_days' => 90,
+		'topic_type' => 'digest',
 	];
 	$selectedFeeds = array_fill_keys($topic['feed_ids'], true);
 	$selectedCategories = array_fill_keys($topic['category_ids'], true);
@@ -66,6 +67,16 @@
 		<label class="group-name" for="topic_name"><?= _t('ext.topic_digest.name') ?></label>
 		<div class="group-controls"><input class="w100" id="topic_name" name="name" maxlength="200"
 			value="<?= $esc((string)$topic['name']) ?>" required="required" /></div>
+	</div>
+	<div class="form-group">
+		<label class="group-name" for="topic_type"><?= _t('ext.topic_digest.topic_type') ?></label>
+		<div class="group-controls"><select id="topic_type" name="topic_type">
+			<?php foreach (['digest', 'feed'] as $type): ?>
+				<option value="<?= $type ?>" <?= $topic['topic_type'] === $type ? 'selected="selected"' : '' ?>>
+					<?= _t('ext.topic_digest.topic_type_' . $type) ?>
+				</option>
+			<?php endforeach; ?>
+		</select><p class="help"><?= _t('ext.topic_digest.topic_type_help') ?></p></div>
 	</div>
 	<div class="form-group">
 		<label class="group-name" for="topic_description"><?= _t('ext.topic_digest.description') ?></label>
@@ -130,9 +141,10 @@
 <?php endif; ?>
 <?php foreach ($this->topics as $item): ?>
 	<section class="topic-digest-card">
-		<h4><?= $esc((string)$item['name']) ?> <?= $item['enabled'] ? '' : '<small>(' . _t('ext.topic_digest.paused') . ')</small>' ?></h4>
+		<h4><?= $esc((string)$item['name']) ?> <small>— <?= _t('ext.topic_digest.topic_type_' . $item['topic_type']) ?>
+			<?= $item['enabled'] ? '' : '(' . _t('ext.topic_digest.paused') . ')' ?></small></h4>
 		<p><?= nl2br($esc((string)$item['description'])) ?></p>
-		<p class="topic-digest-card-statistics"><strong><?= _t('ext.topic_digest.articles_in_digest') ?>:</strong>
+		<p class="topic-digest-card-statistics"><strong><?= _t('ext.topic_digest.articles_in_topic') ?>:</strong>
 			<?= (int)$item['article_count'] ?> · <strong><?= _t('ext.topic_digest.events') ?>:</strong>
 			<?= (int)$item['event_count'] ?></p>
 		<div class="topic-digest-card-actions">

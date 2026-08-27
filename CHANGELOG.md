@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.2 - 2026-08-27
+
+- Order digest events by their effective event date rather than the date of the
+  latest coverage.
+- Label effective event dates and RSS publication timestamps explicitly.
+
 ## 0.3.1 - 2026-08-27
 
 - Pin a living event overview above the individual articles in every

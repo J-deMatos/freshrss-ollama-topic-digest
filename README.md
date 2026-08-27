@@ -80,11 +80,12 @@ newest matched article so it remains first in the topic list. Sidebar topic name
 show their aggregated source count as `[ number ]` alongside FreshRSS's normal
 unread counter.
 
-In low-priority topics, events and their source links are ordered newest-first.
-Classification uses the topic name, inclusion description, and exclusions, and
-requires direct evidence rather than a shared keyword. Structured requests
-evaluate up to eight topics or ten event candidates at once. Exact revision-safe
-decisions are cached.
+Events are ordered newest-first by their effective event date. Source links
+within an event are ordered by RSS publication time; both dates are labelled in
+the overview. Classification uses the topic name, inclusion description, and
+exclusions, and requires direct evidence rather than a shared keyword.
+Structured requests evaluate up to eight topics or ten event candidates at
+once. Exact revision-safe decisions are cached.
 
 ## Restore and rebuild
 

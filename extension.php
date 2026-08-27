@@ -627,7 +627,9 @@ final class TopicDigestExtension extends Minz_Extension {
 		}
 		$html .= '<ol class="topic-digest-events">';
 		foreach ($this->store()->events((int)$topic['id']) as $event) {
-			$html .= '<li><article><header><time datetime="' . $esc(date(DATE_ATOM, (int)$event['occurred_at'])) . '">'
+			$html .= '<li><article><header><span class="topic-digest-date-label">'
+				. $esc(_t('ext.topic_digest.effective_date')) . ':</span> <time datetime="'
+				. $esc(date(DATE_ATOM, (int)$event['occurred_at'])) . '">'
 				. $esc(date('Y-m-d', (int)$event['occurred_at'])) . '</time> — <strong>' . $esc((string)$event['title'])
 				. '</strong></header><ul>';
 			foreach ($event['sources'] as $source) {
@@ -637,6 +639,7 @@ final class TopicDigestExtension extends Minz_Extension {
 				}
 				$html .= '<li><a href="' . $esc($url) . '" rel="noopener noreferrer">' . $esc((string)$source['title'])
 					. '</a> — ' . $esc((string)$source['feed_name']) . ' · '
+					. $esc(_t('ext.topic_digest.published')) . ': '
 					. $esc(date('Y-m-d H:i', (int)$source['published_at']));
 				if ($interactive) {
 					$html .= $this->actionForm('restoreSource', (int)$topic['id'], _t('ext.topic_digest.restore'), [

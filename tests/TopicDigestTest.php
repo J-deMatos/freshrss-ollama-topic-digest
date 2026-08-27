@@ -86,12 +86,12 @@ final class TopicDigestTest extends TestCase {
 		self::assertCount(1, $this->store->suggestions($topicId));
 	}
 
-	public function testEventsMoveToTopWhenTheyReceiveTheLatestSource(): void {
+	public function testEventsRemainOrderedByEffectiveDateWhenOlderEventsReceiveCoverage(): void {
 		$topicId = $this->store->saveTopic(['name' => 'AI', 'description' => 'AI model releases',
 			'enabled' => true, 'all_feeds' => true]);
 		$first = $this->store->addMatch($topicId, $this->job('100', 'First event'), 'Feed', 'First event',
 			1_700_000_000, 'First event', [1.0], null);
-		$this->store->addMatch($topicId, $this->job('200', 'Second event'), 'Feed', 'Second event',
+		$second = $this->store->addMatch($topicId, $this->job('200', 'Second event'), 'Feed', 'Second event',
 			1_700_000_100, 'Second event', [1.0], null);
 		$coverage = $this->job('300', 'New coverage of first');
 		$coverage['published_at'] = 1_700_000_200;
@@ -99,8 +99,9 @@ final class TopicDigestTest extends TestCase {
 			1_700_000_200, 'New coverage', [1.0], $first['event_id']);
 
 		$events = $this->store->events($topicId);
-		self::assertSame($first['event_id'], (int)$events[0]['id']);
-		self::assertSame('300', $events[0]['sources'][0]['entry_id']);
+		self::assertSame($second['event_id'], (int)$events[0]['id']);
+		self::assertSame($first['event_id'], (int)$events[1]['id']);
+		self::assertSame('300', $events[1]['sources'][0]['entry_id']);
 	}
 
 	public function testClassifierRevisionStartsOnlyOneBackfill(): void {

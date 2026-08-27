@@ -628,7 +628,7 @@ final class TopicDigestStore {
 	public function events(int $topicId): array {
 		$statement = $this->pdo->prepare('SELECT e.*,COALESCE(MAX(s.published_at),e.occurred_at) AS latest_addition_at,'
 			. 'COALESCE(MAX(s.rowid),0) AS latest_source_order FROM events e LEFT JOIN sources s ON s.event_id=e.id '
-			. 'WHERE e.topic_id=? GROUP BY e.id ORDER BY latest_addition_at DESC,latest_source_order DESC,e.id DESC');
+			. 'WHERE e.topic_id=? GROUP BY e.id ORDER BY e.occurred_at DESC,latest_source_order DESC,e.id DESC');
 		$statement->execute([$topicId]);
 		$events = $statement->fetchAll();
 		$source = $this->pdo->prepare('SELECT * FROM sources WHERE event_id=? ORDER BY published_at DESC,entry_id');

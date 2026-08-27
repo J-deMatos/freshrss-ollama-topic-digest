@@ -36,6 +36,8 @@ return [
 		'restore' => 'Restore',
 		'restore_all' => 'Restore all',
 		'why_matched' => 'Why it matched',
+		'effective_date' => 'Effective date',
+		'published' => 'Published',
 		'source_restored' => 'The source was restored to the unread stream.',
 		'event_restored' => 'The event sources were restored to the unread stream.',
 		'confidence' => 'Minimum match confidence',

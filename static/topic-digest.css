@@ -1,0 +1,12 @@
+.topic-digest-events > li { margin-block: 1rem; }
+.topic-digest-events header { margin-block-end: .35rem; }
+.topic-digest-action, .topic-digest-card-actions form { display: inline-block; margin-inline-start: .4rem; }
+.topic-digest-card { border-block-start: 1px solid var(--border-color, #ccc); padding-block: .8rem; }
+.topic-digest-card-statistics { color: var(--font-color-grey, #666); }
+.topic-digest-card-actions { display: flex; flex-wrap: wrap; gap: .4rem; }
+.topic-digest-card-actions form { margin: 0; }
+.topic-digest-status { display: grid; grid-template-columns: max-content auto; gap: .25rem 1rem; }
+.topic-digest-status dd { margin: 0; }
+.topic-digest-sidebar-count { color: var(--font-color-grey, #666); white-space: nowrap; }
+.state_unread .category.topic-digest-always-visible,
+.state_unread .feed.topic-digest-always-visible { display: list-item !important; }

@@ -1,0 +1,59 @@
+.topic-digest-global-stats {
+	position: relative;
+}
+
+.topic-digest-global-stats > summary {
+	cursor: pointer;
+	list-style: none;
+}
+
+.topic-digest-global-stats > summary::-webkit-details-marker {
+	display: none;
+}
+
+.topic-digest-global-stats-panel {
+	background: var(--background-color, #fff);
+	border: 1px solid var(--border-color, #aaa);
+	box-shadow: 0 0.25rem 0.75rem rgb(0 0 0 / 20%);
+	min-width: 18rem;
+	padding: 0.75rem;
+	position: absolute;
+	right: 0;
+	top: 100%;
+	z-index: 1000;
+}
+
+.topic-digest-global-stats-panel dl {
+	display: grid;
+	gap: 0.35rem 1rem;
+	grid-template-columns: 1fr auto;
+	margin: 0 0 0.75rem;
+}
+
+.topic-digest-global-stats-panel dd {
+	font-weight: bold;
+	margin: 0;
+	text-align: right;
+}
+
+.topic-digest-global-stats-panel dt {
+	margin: 0;
+}
+
+.topic-digest-worker-toggle,
+.topic-digest-worker-restart {
+	display: block;
+	margin-top: 0.75rem;
+	width: 100%;
+}
+
+.topic-digest-worker-restart {
+	margin-top: 0.35rem;
+}
+
+.topic-digest-control-status {
+	color: var(--alert-error-color, #a00);
+	display: block;
+	font-size: 0.85em;
+	margin-top: 0.35rem;
+}

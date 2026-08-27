@@ -1,0 +1,7 @@
+/.phpunit.cache/
+/vendor/
+/composer.lock
+*.log
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal

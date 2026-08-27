@@ -1,0 +1,197 @@
+<?php
+	declare(strict_types=1);
+	/** @var TopicDigestExtension $this */
+	$esc = static fn(string $value): string => htmlspecialchars($value, ENT_QUOTES, 'UTF-8');
+	$action = _url('extension', 'configure', 'e', urlencode($this->getName()));
+	$topic = $this->editTopic ?? [
+		'id' => 0, 'name' => '', 'description' => '', 'exclusions' => [], 'enabled' => true,
+		'confidence' => 0.85, 'all_feeds' => true, 'all_categories' => false,
+		'feed_ids' => [], 'category_ids' => [], 'backfill_mode' => 'days', 'backfill_days' => 90,
+	];
+	$selectedFeeds = array_fill_keys($topic['feed_ids'], true);
+	$selectedCategories = array_fill_keys($topic['category_ids'], true);
+?>
+
+<h2><?= _t('ext.topic_digest.title') ?></h2>
+<p><?= _t('ext.topic_digest.intro') ?></p>
+
+<details>
+	<summary><strong><?= _t('ext.topic_digest.ollama') ?></strong></summary>
+	<form action="<?= $action ?>" method="post">
+		<input type="hidden" name="_csrf" value="<?= FreshRSS_Auth::csrfToken() ?>" />
+		<input type="hidden" name="topic_digest_action" value="save_settings" />
+		<?php foreach (['ollama_url', 'summary_model', 'judge_model', 'embedding_model'] as $field): ?>
+			<div class="form-group">
+				<label class="group-name" for="<?= $field ?>"><?= _t('ext.topic_digest.' . $field) ?></label>
+				<div class="group-controls"><input class="w100" id="<?= $field ?>" name="<?= $field ?>"
+					value="<?= $esc((string)$this->settings[$field]) ?>" required="required" /></div>
+			</div>
+		<?php endforeach; ?>
+		<div class="form-group">
+			<label class="group-name" for="timeout"><?= _t('ext.topic_digest.timeout') ?></label>
+			<div class="group-controls"><input type="number" id="timeout" name="timeout" min="10" max="7200"
+				value="<?= (int)$this->settings['timeout'] ?>" /></div>
+		</div>
+		<div class="form-group"><div class="group-controls"><label><input type="checkbox" name="scraping" value="1"
+			<?= $this->settings['scraping'] ? 'checked="checked"' : '' ?> /> <?= _t('ext.topic_digest.scraping') ?></label></div></div>
+		<div class="form-group form-actions"><div class="group-controls">
+			<button class="btn btn-important" type="submit"><?= _t('ext.topic_digest.save') ?></button>
+			<button class="btn" type="submit" name="topic_digest_action" value="test"><?= _t('ext.topic_digest.test') ?></button>
+		</div></div>
+	</form>
+</details>
+
+<details>
+	<summary><strong><?= _t('ext.topic_digest.display_settings') ?></strong></summary>
+	<form action="<?= $action ?>" method="post">
+		<input type="hidden" name="_csrf" value="<?= FreshRSS_Auth::csrfToken() ?>" />
+		<input type="hidden" name="topic_digest_action" value="save_display_settings" />
+		<div class="form-group"><div class="group-controls"><label>
+			<input type="checkbox" name="always_show_topics" value="1"
+				<?= $this->settings['always_show_topics'] ? 'checked="checked"' : '' ?> />
+			<?= _t('ext.topic_digest.always_show_topics') ?>
+		</label><p class="help"><?= _t('ext.topic_digest.always_show_topics_help') ?></p></div></div>
+		<div class="form-group form-actions"><div class="group-controls">
+			<button class="btn btn-important" type="submit"><?= _t('ext.topic_digest.save') ?></button>
+		</div></div>
+	</form>
+</details>
+
+<h3><?= (int)$topic['id'] > 0 ? _t('ext.topic_digest.edit_topic') : _t('ext.topic_digest.new_topic') ?></h3>
+<form action="<?= $action ?>" method="post" data-topic-digest-editor="1">
+	<input type="hidden" name="_csrf" value="<?= FreshRSS_Auth::csrfToken() ?>" />
+	<input type="hidden" name="topic_digest_action" value="save_topic" />
+	<input type="hidden" name="topic_id" value="<?= (int)$topic['id'] ?>" />
+	<div class="form-group">
+		<label class="group-name" for="topic_name"><?= _t('ext.topic_digest.name') ?></label>
+		<div class="group-controls"><input class="w100" id="topic_name" name="name" maxlength="200"
+			value="<?= $esc((string)$topic['name']) ?>" required="required" /></div>
+	</div>
+	<div class="form-group">
+		<label class="group-name" for="topic_description"><?= _t('ext.topic_digest.description') ?></label>
+		<div class="group-controls"><textarea class="w100" id="topic_description" name="description" rows="5"
+			required="required"><?= $esc((string)$topic['description']) ?></textarea>
+			<p class="help"><?= _t('ext.topic_digest.description_help') ?></p></div>
+	</div>
+	<div class="form-group">
+		<label class="group-name" for="topic_exclusions"><?= _t('ext.topic_digest.exclusions') ?></label>
+		<div class="group-controls">
+			<textarea class="w100" id="topic_exclusions" name="exclusions" rows="4"><?=
+				$esc(implode("\n", $topic['exclusions'])) ?></textarea>
+			<p class="help"><?= _t('ext.topic_digest.exclusions_help') ?></p></div>
+	</div>
+	<div class="form-group">
+		<label class="group-name" for="topic_confidence"><?= _t('ext.topic_digest.confidence') ?></label>
+		<div class="group-controls"><input type="number" id="topic_confidence" name="confidence" min="0" max="1"
+			step="0.01" value="<?= $esc((string)$topic['confidence']) ?>" /></div>
+	</div>
+	<div class="form-group"><div class="group-controls"><label><input type="checkbox" name="enabled" value="1"
+		<?= $topic['enabled'] ? 'checked="checked"' : '' ?> /> <?= _t('gen.action.enable') ?></label></div></div>
+
+	<details>
+		<summary><strong><?= _t('ext.topic_digest.scope') ?></strong></summary>
+		<div class="form-group"><div class="group-name"><?= _t('ext.topic_digest.categories') ?></div><div class="group-controls">
+			<label><input type="checkbox" name="all_categories" value="1" data-select-all="category_ids[]"
+				<?= $topic['all_categories'] ? 'checked="checked"' : '' ?> /> <strong><?= _t('ext.topic_digest.all_categories') ?></strong></label><br />
+			<?php foreach ($this->categories as $category): ?>
+				<label><input type="checkbox" name="category_ids[]" value="<?= $category->id() ?>"
+					<?= isset($selectedCategories[$category->id()]) ? 'checked="checked"' : '' ?> /> <?= $esc($category->name()) ?></label><br />
+			<?php endforeach; ?>
+		</div></div>
+		<div class="form-group"><div class="group-name"><?= _t('ext.topic_digest.feeds') ?></div><div class="group-controls">
+			<label><input type="checkbox" name="all_feeds" value="1" data-select-all="feed_ids[]"
+				<?= $topic['all_feeds'] ? 'checked="checked"' : '' ?> /> <strong><?= _t('ext.topic_digest.all_feeds') ?></strong></label><br />
+			<?php foreach ($this->feeds as $feed): ?>
+				<label><input type="checkbox" name="feed_ids[]" value="<?= $feed->id() ?>"
+					<?= isset($selectedFeeds[$feed->id()]) ? 'checked="checked"' : '' ?> />
+					<?= $esc(htmlspecialchars_decode($feed->name(raw: true), ENT_QUOTES)) ?></label><br />
+			<?php endforeach; ?>
+		</div></div>
+	</details>
+
+	<div class="form-group">
+		<label class="group-name" for="backfill_mode"><?= _t('ext.topic_digest.backfill') ?></label>
+		<div class="group-controls"><select id="backfill_mode" name="backfill_mode">
+			<?php foreach (['days', 'all', 'future'] as $mode): ?>
+				<option value="<?= $mode ?>" <?= $topic['backfill_mode'] === $mode ? 'selected="selected"' : '' ?>><?= _t('ext.topic_digest.backfill_' . $mode) ?></option>
+			<?php endforeach; ?>
+		</select>
+		<input type="number" name="backfill_days" min="1" max="3650" value="<?= (int)$topic['backfill_days'] ?>" data-backfill-days="1" /></div>
+	</div>
+	<div class="form-group form-actions"><div class="group-controls">
+		<button class="btn btn-important" type="submit"><?= _t('ext.topic_digest.save') ?></button>
+		<?php if ((int)$topic['id'] > 0): ?><a class="btn" href="<?= $action ?>"><?= _t('gen.action.cancel') ?></a><?php endif; ?>
+	</div></div>
+</form>
+
+<h3><?= _t('ext.topic_digest.topics') ?></h3>
+<?php if ($this->topics === []): ?>
+	<p><?= _t('ext.topic_digest.no_topics') ?></p>
+<?php endif; ?>
+<?php foreach ($this->topics as $item): ?>
+	<section class="topic-digest-card">
+		<h4><?= $esc((string)$item['name']) ?> <?= $item['enabled'] ? '' : '<small>(' . _t('ext.topic_digest.paused') . ')</small>' ?></h4>
+		<p><?= nl2br($esc((string)$item['description'])) ?></p>
+		<p class="topic-digest-card-statistics"><strong><?= _t('ext.topic_digest.articles_in_digest') ?>:</strong>
+			<?= (int)$item['article_count'] ?> · <strong><?= _t('ext.topic_digest.events') ?>:</strong>
+			<?= (int)$item['event_count'] ?></p>
+		<div class="topic-digest-card-actions">
+			<a class="btn" href="<?= _url('extension', 'configure', 'e', urlencode($this->getName()),
+				'edit_topic', (int)$item['id']) ?>"><?= _t('ext.topic_digest.edit') ?></a>
+			<form action="<?= $action ?>" method="post"><input type="hidden" name="_csrf" value="<?= FreshRSS_Auth::csrfToken() ?>" />
+				<input type="hidden" name="topic_digest_action" value="toggle" /><input type="hidden" name="topic_id" value="<?= (int)$item['id'] ?>" />
+				<input type="hidden" name="enabled" value="<?= $item['enabled'] ? '0' : '1' ?>" />
+				<button class="btn" type="submit"><?= $item['enabled'] ? _t('ext.topic_digest.pause') : _t('ext.topic_digest.resume') ?></button></form>
+			<form action="<?= $action ?>" method="post"><input type="hidden" name="_csrf" value="<?= FreshRSS_Auth::csrfToken() ?>" />
+				<input type="hidden" name="topic_digest_action" value="rescan" /><button class="btn" type="submit"><?= _t('ext.topic_digest.rescan') ?></button></form>
+			<form action="<?= $action ?>" method="post"><input type="hidden" name="_csrf" value="<?= FreshRSS_Auth::csrfToken() ?>" />
+				<input type="hidden" name="topic_digest_action" value="preview" /><input type="hidden" name="topic_id" value="<?= (int)$item['id'] ?>" />
+				<button class="btn" type="submit"><?= _t('ext.topic_digest.preview') ?></button></form>
+			<?php foreach (['delete', 'restore_delete'] as $delete): ?>
+				<form action="<?= $action ?>" method="post"><input type="hidden" name="_csrf" value="<?= FreshRSS_Auth::csrfToken() ?>" />
+					<input type="hidden" name="topic_digest_action" value="<?= $delete ?>" /><input type="hidden" name="topic_id" value="<?= (int)$item['id'] ?>" />
+					<button class="btn confirm" type="submit"><?= _t('ext.topic_digest.' . $delete) ?></button></form>
+			<?php endforeach; ?>
+		</div>
+		<?php foreach ($item['suggestions'] as $suggestion): ?>
+			<div class="alert alert-warn"><strong><?= _t('ext.topic_digest.suggested_exclusion') ?>:</strong> <?= $esc((string)$suggestion['text']) ?>
+				<?php foreach (['approve', 'dismiss'] as $decision): ?>
+					<form class="topic-digest-action" action="<?= $action ?>" method="post"><input type="hidden" name="_csrf" value="<?= FreshRSS_Auth::csrfToken() ?>" />
+						<input type="hidden" name="topic_digest_action" value="suggestion" /><input type="hidden" name="topic_id" value="<?= (int)$item['id'] ?>" />
+						<input type="hidden" name="suggestion_id" value="<?= (int)$suggestion['id'] ?>" /><input type="hidden" name="decision" value="<?= $decision ?>" />
+						<button class="btn btn-mini" type="submit"><?= _t('ext.topic_digest.' . $decision) ?></button></form>
+				<?php endforeach; ?>
+			</div>
+		<?php endforeach; ?>
+	</section>
+<?php endforeach; ?>
+
+<h3><?= _t('ext.topic_digest.status') ?></h3>
+<dl class="topic-digest-status">
+	<?php foreach (['topics', 'events', 'sources', 'queued', 'processing', 'processed', 'failed', 'backfill_active'] as $key): ?>
+		<dt><?= _t('ext.topic_digest.' . $key) ?></dt><dd><?= (int)($this->status[$key] ?? 0) ?></dd>
+	<?php endforeach; ?>
+</dl>
+<form action="<?= $action ?>" method="post"><input type="hidden" name="_csrf" value="<?= FreshRSS_Auth::csrfToken() ?>" />
+	<input type="hidden" name="topic_digest_action" value="retry" /><button class="btn" type="submit"><?= _t('ext.topic_digest.retry') ?></button></form>
+<form class="topic-digest-action" action="<?= $action ?>" method="post">
+	<input type="hidden" name="_csrf" value="<?= FreshRSS_Auth::csrfToken() ?>" />
+	<input type="hidden" name="topic_digest_action" value="<?= (int)($this->status['paused'] ?? 0) !== 0 ? 'resume' : 'pause' ?>" />
+	<button class="btn" type="submit"><?= _t('ext.topic_digest.'
+		. ((int)($this->status['paused'] ?? 0) !== 0 ? 'resume_worker' : 'pause_worker')) ?></button>
+</form>
+<form class="topic-digest-action" action="<?= $action ?>" method="post">
+	<input type="hidden" name="_csrf" value="<?= FreshRSS_Auth::csrfToken() ?>" />
+	<input type="hidden" name="topic_digest_action" value="restart" />
+	<button class="btn" type="submit"><?= _t('ext.topic_digest.restart_worker') ?></button>
+</form>
+<form class="topic-digest-action" action="<?= $action ?>" method="post">
+	<input type="hidden" name="_csrf" value="<?= FreshRSS_Auth::csrfToken() ?>" />
+	<input type="hidden" name="topic_digest_action" value="reset_log" />
+	<button class="btn confirm" type="submit"><?= _t('ext.topic_digest.reset_log') ?></button>
+</form>
+
+<?php if ($this->errors !== []): ?>
+	<h4><?= _t('ext.topic_digest.recent_errors') ?></h4>
+	<ul><?php foreach ($this->errors as $error): ?><li><?= $esc((string)$error['title']) ?> — <?= $esc((string)$error['error']) ?></li><?php endforeach; ?></ul>
+<?php endif; ?>

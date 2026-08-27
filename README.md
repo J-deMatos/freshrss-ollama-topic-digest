@@ -1,0 +1,130 @@
+# FreshRSS Topic Digest
+
+A per-user FreshRSS extension that moves low-priority news into living,
+event-grouped topic digests using a local Ollama service.
+
+## Requirements
+
+- FreshRSS with PHP 8.1 or newer and SQLite PDO support
+- Ollama reachable from the FreshRSS container or host
+- PHP `exec()` for the automatic worker, or a cron job for the CLI worker
+- Write access to FreshRSS's per-user extension data directory
+
+The default Ollama URL is `http://ollama:11434`, suitable when FreshRSS and
+Ollama share a Docker network. Do not use `localhost` unless Ollama runs inside
+the FreshRSS container.
+
+## Installation
+
+Place this repository at exactly:
+
+```text
+FreshRSS/extensions/xExtension-TopicDigest/
+```
+
+For example:
+
+```sh
+git clone 'https://github.com/OWNER/REPOSITORY.git' \
+	/var/www/FreshRSS/extensions/xExtension-TopicDigest
+```
+
+Enable **Topic Digest** for the intended FreshRSS user, open its settings, test
+the Ollama connection, and create one or more topics. Configuration and the
+SQLite sidecar remain in FreshRSS's per-user data area during upgrades.
+
+## Ollama models
+
+The CPU-oriented defaults are `qwen3.5:4b` for summaries, `qwen3.5:9b` for
+topic and event decisions, and `qwen3-embedding:0.6b` for embeddings. Install
+them with:
+
+```sh
+ollama pull qwen3.5:4b
+ollama pull qwen3.5:9b
+ollama pull qwen3-embedding:0.6b
+```
+
+When News Deduplicator is installed, both extensions reuse the same per-user
+article summary and embedding only when the article content and model names
+match. Neither extension has a runtime dependency on the other.
+
+## Digest behaviour
+
+Each topic has an inclusion description, explicit exclusions, confidence,
+feed/category scope, and history period. Matching reports are grouped into
+events and shown in one living entry under the synthetic **Topic Digests**
+category. A genuinely new event marks the digest unread; additional coverage
+of an existing event does not.
+
+Synthetic feeds do not appear in the main stream or participate in network
+refresh, archive scanning, or matching. The category opens all living digests,
+and an optional display setting keeps them visible in unread-only mode. Sidebar
+topic names show their aggregated source count as `[ number ]`.
+
+Events and their source links are ordered newest-first. Classification uses the
+topic name, inclusion description, and exclusions, and requires direct evidence
+rather than a shared keyword. Structured requests evaluate up to eight topics
+or ten event candidates at once. Exact revision-safe decisions are cached.
+
+## Restore and rebuild
+
+Matching source articles are marked read only after the digest update succeeds.
+Favourites and explicit manual-unread choices remain protected. **Restore** and
+**Restore all** return sources to the normal unread stream and create a pending
+exclusion suggestion; topic rules change only after user approval.
+
+**Restart and rebuild Topic Digest** immediately clears generated memberships,
+retains reusable summaries and user-authored rules, and reclassifies retained
+articles. Sources that still match return to the rebuilt digest; sources that
+no longer match return to the normal unread stream.
+
+## Worker and status
+
+A single locked worker starts automatically, uses expiring leases and retry
+backoff, and reloads after live code or configuration changes. The navigation
+status panel reports the queue, throughput, estimated completion time, events,
+sources, and failures, with Pause/Resume and rebuild controls.
+
+If automatic execution is unavailable, run the worker from cron:
+
+```sh
+php /var/www/FreshRSS/extensions/xExtension-TopicDigest/cli/process.php \
+	--user alice --limit 20
+```
+
+Average throughput includes only monotonic active time for successfully
+completed jobs. Pauses, archive scanning, failures, idle time, daemon downtime,
+wall-clock changes, and system suspend are excluded.
+
+## Development and tests
+
+Run the extension tests against a FreshRSS source checkout with its development
+dependencies installed:
+
+```sh
+FRESHRSS_PATH=/path/to/FreshRSS \
+	/path/to/FreshRSS/vendor/bin/phpunit -c phpunit.xml.dist
+```
+
+Lint PHP before a release:
+
+```sh
+find . -type f \( -name '*.php' -o -name '*.phtml' \) \
+	-exec php -l {} \;
+```
+
+Create an installable archive from a tag with:
+
+```sh
+git archive --format=tar.gz \
+	--prefix=xExtension-TopicDigest/ \
+	-o xExtension-TopicDigest.tar.gz HEAD
+```
+
+See [CHANGELOG.md](CHANGELOG.md) for release notes.
+
+## License
+
+This extension is distributed under the GNU Affero General Public License,
+version 3. See [LICENSE](LICENSE).

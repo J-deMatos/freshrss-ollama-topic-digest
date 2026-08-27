@@ -1,0 +1,34 @@
+# Changelog
+
+## 0.2.6 - 2026-08-27
+
+- Make Restart perform a complete digest rebuild under the current topic rules.
+- Clear generated events immediately and reclassify retained articles.
+- Restore sources that no longer match to the normal unread stream.
+- Preserve summaries, topic rules, exclusions, and explicit restore decisions.
+
+## 0.2.5 - 2026-08-27
+
+- Add a user-triggered, revision-safe worker restart control.
+
+## 0.2.4 - 2026-08-27
+
+- Tighten topic classification with explicit semantic-domain checks.
+- Order events and sources by their newest coverage.
+
+## 0.2.3 - 2026-08-27
+
+- Derive average throughput from active-time samples attached to completed jobs.
+
+## 0.2.2 - 2026-08-27
+
+- Optionally keep living topic digests visible in unread-only mode.
+
+## 0.2.0 - 2026-08-27
+
+- Batch topic and event decisions while preserving exact revision-safe caches.
+
+## 0.1.0 - 2026-08-27
+
+- Add topic rules, archive backfill, synthetic feeds, event grouping, Restore
+  controls, exclusion suggestions, Ollama processing, and worker status.

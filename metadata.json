@@ -1,0 +1,8 @@
+{
+	"name": "Topic Digest",
+	"author": "Topic Digest contributors",
+	"description": "Aggregate low-priority news into living topic digests with a local Ollama service.",
+	"version": "0.2.6",
+	"entrypoint": "TopicDigest",
+	"type": "user"
+}

@@ -46,11 +46,12 @@ final class TopicDigestExtension extends Minz_Extension {
 		$this->registerController('topicDigest');
 		// EntryBeforeAdd runs after FreshRSS applies feed filters. Fall back for older releases.
 		if (defined(Minz_HookType::class . '::EntryBeforeAdd')) {
-			$this->registerHook(constant(Minz_HookType::class . '::EntryBeforeAdd'), [$this, 'enqueueEntry']);
+			// Queue Topic Digest before News Deduplicator (which uses the default priority).
+			$this->registerHook(constant(Minz_HookType::class . '::EntryBeforeAdd'), [$this, 'enqueueEntry'], -100);
 		} else {
-			$this->registerHook(Minz_HookType::EntryBeforeInsert, [$this, 'enqueueEntry']);
+			$this->registerHook(Minz_HookType::EntryBeforeInsert, [$this, 'enqueueEntry'], -100);
 		}
-		$this->registerHook(Minz_HookType::EntryBeforeUpdate, [$this, 'enqueueEntry']);
+		$this->registerHook(Minz_HookType::EntryBeforeUpdate, [$this, 'enqueueEntry'], -100);
 		if ($this->supportsEntriesReadHook()) {
 			$this->registerHook(constant(Minz_HookType::class . '::EntriesRead'), [$this, 'entriesRead']);
 		}
@@ -877,13 +878,13 @@ final class TopicDigestExtension extends Minz_Extension {
 				$this->store()->invalidateEmbeddings();
 			}
 			$this->store()->startBackfill();
-			Minz_Request::good(_t('feedback.conf.updated'));
+			Minz_Request::good(_t('feedback.conf.updated'), $this->settingsRedirect());
 		} elseif ($action === 'save_display_settings') {
 			$config = $this->configuration();
 			$config['always_show_topics'] = Minz_Request::paramBoolean('always_show_topics');
 			/** @phpstan-ignore method.deprecated */
 			$this->setUserConfiguration($config);
-			Minz_Request::good(_t('feedback.conf.updated'));
+			Minz_Request::good(_t('feedback.conf.updated'), $this->settingsRedirect());
 		} elseif ($action === 'save_topic') {
 			$id = Minz_Request::paramInt('topic_id');
 			$values = [
@@ -901,7 +902,7 @@ final class TopicDigestExtension extends Minz_Extension {
 			$this->store()->startBackfill();
 			$this->syntheticFeedIds = null;
 			$this->synchroniseTopic($topicId, false);
-			Minz_Request::good(_t('feedback.conf.updated'));
+			Minz_Request::good(_t('feedback.conf.updated'), $this->settingsRedirect());
 		} elseif ($action === 'toggle') {
 			$enabled = Minz_Request::paramBoolean('enabled');
 			$this->store()->setTopicEnabled(Minz_Request::paramInt('topic_id'), $enabled);
@@ -978,6 +979,11 @@ final class TopicDigestExtension extends Minz_Extension {
 			throw new InvalidArgumentException('Unknown Topic Digest action.');
 		}
 		Minz_Request::good('Topic Digest updated.');
+	}
+
+	/** @return array{c:string,a:string,params:array{e:string}} */
+	private function settingsRedirect(): array {
+		return ['c' => 'extension', 'a' => 'configure', 'params' => ['e' => $this->getName()]];
 	}
 
 	private function validOllamaUrl(string $url): bool {

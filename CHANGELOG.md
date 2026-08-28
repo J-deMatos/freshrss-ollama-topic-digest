@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.5 - 2026-08-28
+
+- Queue new entries before News Deduplicator through FreshRSS hook priority.
+- Keep configuration saves on the Topic Digest settings page.
+
 ## 0.3.4 - 2026-08-27
 
 - Clarify that the project is exploratory and intended for personal FreshRSS

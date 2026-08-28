@@ -57,6 +57,9 @@ When News Deduplicator is installed, both extensions reuse the same per-user
 article summary and embedding only when the article content and model names
 match. Neither extension has a runtime dependency on the other.
 
+When both are enabled, Topic Digest receives each new article first at the
+FreshRSS queue hook, so classification is queued before deduplication.
+
 ## Topic presentations
 
 Each topic has one of two presentations:

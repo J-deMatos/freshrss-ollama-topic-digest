@@ -177,6 +177,14 @@ final class TopicDigestExtension extends Minz_Extension {
 		return $entry;
 	}
 
+	public function shouldBlockNewsDeduplicator(FreshRSS_Entry $entry): bool {
+		if ($this->store()->isPaused() || $this->store()->topics(true) === []
+				|| $this->isSyntheticFeed($entry->feedId())) {
+			return false;
+		}
+		return $this->store()->classificationPending($entry->id(), $entry->hash());
+	}
+
 	/** @param list<numeric-string> $ids */
 	public function entriesRead(array $ids, bool $isRead): void {
 		if ($this->suppressManualUnreadTracking) {

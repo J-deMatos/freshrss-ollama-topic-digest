@@ -124,6 +124,12 @@ backoff, and reloads after live code or configuration changes. The navigation
 status panel reports the queue, throughput, estimated completion time, events,
 sources, and failures, with Pause/Resume and rebuild controls.
 
+When both extensions are enabled, Topic Digest queues first and News
+Deduplicator waits for its classification of the same article revision. Topic
+matches can therefore mark the source read before deduplication; a non-match
+continues through News Deduplicator normally. Pausing or disabling Topic Digest
+does not pause News Deduplicator.
+
 If automatic execution is unavailable, run the worker from cron:
 
 ```sh

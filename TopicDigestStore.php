@@ -438,6 +438,12 @@ final class TopicDigestStore {
 			&& hash_equals((string)$row['pipeline_hash'], (string)$job['pipeline_hash']);
 	}
 
+	public function classificationPending(string $entryId, string $contentHash): bool {
+		$row = $this->row('SELECT content_hash,state FROM jobs WHERE entry_id=?', [$entryId]);
+		return $row !== null && hash_equals((string)$row['content_hash'], $contentHash)
+			&& in_array((string)$row['state'], ['pending', 'processing'], true);
+	}
+
 	/** @param array<string,mixed> $job @param list<float> $embedding */
 	public function saveSummaryIfCurrent(array $job, string $analysisHash, string $feedName, string $summary,
 		string $sourceText, array $embedding): bool {

@@ -65,6 +65,21 @@ final class TopicDigestTest extends TestCase {
 		self::assertTrue($this->store->enqueue($entry, 2, 'pipeline-two'));
 	}
 
+	public function testPendingClassificationOnlyBlocksTheMatchingArticleRevision(): void {
+		$entry = new FreshRSS_Entry(4, 'guid', 'Model released', '', 'Detailed release announcement.',
+			'https://example.com/model', 1_700_000_000);
+		$entry->_id('1700000000000000');
+		$this->store->enqueue($entry, 2, 'pipeline');
+		self::assertTrue($this->store->classificationPending($entry->id(), $entry->hash()));
+		self::assertFalse($this->store->classificationPending($entry->id(), 'different-content'));
+
+		$job = $this->store->claim(600);
+		self::assertNotNull($job);
+		self::assertTrue($this->store->classificationPending($entry->id(), $entry->hash()));
+		self::assertTrue($this->store->completeCurrent($job, 'skipped'));
+		self::assertFalse($this->store->classificationPending($entry->id(), $entry->hash()));
+	}
+
 	public function testMultipleSourcesJoinOneEventAndSourceRestoreIsPersistent(): void {
 		$topicId = $this->store->saveTopic(['name' => 'AI', 'description' => 'AI model releases',
 			'enabled' => true, 'all_feeds' => true]);

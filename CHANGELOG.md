@@ -2,7 +2,10 @@
 
 ## 0.3.5 - 2026-08-28
 
-- Queue new entries before News Deduplicator through FreshRSS hook priority.
+- Queue new and updated entries before News Deduplicator through FreshRSS hook
+  priority.
+- Expose the pending state of an exact article revision so News Deduplicator
+  can wait until Topic Digest classification reaches a terminal result.
 - Keep configuration saves on the Topic Digest settings page.
 
 ## 0.3.4 - 2026-08-27

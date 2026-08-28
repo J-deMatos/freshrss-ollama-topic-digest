@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.0 - 2026-08-28
+
+- Add mark-read topics that automatically read matching originals without
+  creating synthetic FreshRSS objects.
+- Add an optional per-topic verification feed with match explanations and
+  Restore controls for auditing mark-read rules.
+
+## 0.3.6 - 2026-08-28
+
+- Locate the FreshRSS CLI bootstrap in split application/extension layouts,
+  including LinuxServer.io containers with FreshRSS under `/app/www` and
+  extensions under `/config/www/freshrss/extensions`.
+- Stream archive entries in small pages, cache only feed/category identifiers,
+  and interleave scanning with classification to support 128 MB PHP limits.
+
 ## 0.3.5 - 2026-08-28
 
 - Queue new and updated entries before News Deduplicator through FreshRSS hook

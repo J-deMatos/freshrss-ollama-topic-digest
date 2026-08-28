@@ -1,8 +1,8 @@
 # FreshRSS Topic Digest
 
 A per-user FreshRSS extension that organises matching news using a local Ollama
-service. Each topic can be a low-priority living digest or a high-priority feed
-of normal FreshRSS articles.
+service. Each topic can be a low-priority living digest, a high-priority feed
+of normal FreshRSS articles, or a rule that automatically marks matches read.
 
 ## Project status
 
@@ -29,6 +29,10 @@ Place this repository at exactly:
 ```text
 FreshRSS/extensions/xExtension-TopicDigest/
 ```
+
+LinuxServer.io installations instead place additional extensions under
+`/config/www/freshrss/extensions/xExtension-TopicDigest/`. The CLI worker
+automatically locates the FreshRSS core under `/app/www` in that layout.
 
 For example:
 
@@ -75,6 +79,11 @@ Both presentations live under the synthetic **Topic Digests** category and are
 excluded from the main stream, network refresh, archive scanning, and matching.
 Changing presentation replaces only extension-owned generated objects and
 preserves the topic rule and its source memberships.
+
+**Mark read** topics store matches, explanations, events, and Restore decisions
+without creating a synthetic feed by default. A per-topic verification option
+can expose the same living digest temporarily for auditing; it does not change
+the automatic read behavior.
 
 For prominence, the extension places **🧭 Topic Digests** directly below
 Favourites in the sidebar. Topic feeds use **🗂️** for low priority and **⚡** for

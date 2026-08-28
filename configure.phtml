@@ -7,7 +7,7 @@
 		'id' => 0, 'name' => '', 'description' => '', 'exclusions' => [], 'enabled' => true,
 		'confidence' => 0.85, 'all_feeds' => true, 'all_categories' => false,
 		'feed_ids' => [], 'category_ids' => [], 'backfill_mode' => 'days', 'backfill_days' => 90,
-		'topic_type' => 'digest',
+		'topic_type' => 'digest', 'show_verification' => false,
 	];
 	$selectedFeeds = array_fill_keys($topic['feed_ids'], true);
 	$selectedCategories = array_fill_keys($topic['category_ids'], true);
@@ -71,13 +71,18 @@
 	<div class="form-group">
 		<label class="group-name" for="topic_type"><?= _t('ext.topic_digest.topic_type') ?></label>
 		<div class="group-controls"><select id="topic_type" name="topic_type">
-			<?php foreach (['digest', 'feed'] as $type): ?>
+			<?php foreach (['digest', 'feed', 'mark_read'] as $type): ?>
 				<option value="<?= $type ?>" <?= $topic['topic_type'] === $type ? 'selected="selected"' : '' ?>>
 					<?= _t('ext.topic_digest.topic_type_' . $type) ?>
 				</option>
 			<?php endforeach; ?>
 		</select><p class="help"><?= _t('ext.topic_digest.topic_type_help') ?></p></div>
 	</div>
+	<div class="form-group" data-mark-read-verification="1"><div class="group-controls"><label>
+		<input type="checkbox" name="show_verification" value="1"
+			<?= $topic['show_verification'] ? 'checked="checked"' : '' ?> />
+		<?= _t('ext.topic_digest.show_verification') ?>
+	</label><p class="help"><?= _t('ext.topic_digest.show_verification_help') ?></p></div></div>
 	<div class="form-group">
 		<label class="group-name" for="topic_description"><?= _t('ext.topic_digest.description') ?></label>
 		<div class="group-controls"><textarea class="w100" id="topic_description" name="description" rows="5"

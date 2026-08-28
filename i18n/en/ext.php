@@ -2,7 +2,7 @@
 return [
 	'topic_digest' => [
 		'title' => 'Topic Digest',
-		'intro' => 'Organise matching articles as low-priority living digests or high-priority topic feeds.',
+		'intro' => 'Organise matching articles as living digests, high-priority feeds, or automatic mark-read rules.',
 		'ollama' => 'Ollama settings',
 		'ollama_url' => 'Ollama URL',
 		'summary_model' => 'Summary model',
@@ -23,16 +23,23 @@ return [
 		'topic_type' => 'Topic priority and presentation',
 		'topic_type_digest' => '🗂️ Low priority — one living digest entry',
 		'topic_type_feed' => '⚡ High priority — overview and normal article list',
+		'topic_type_mark_read' => '✓ Mark read — hide matching articles from the main feed',
 		'topic_type_help' => 'Low priority collects matches into one event-grouped entry. High priority creates one '
-			. 'living overview followed by one normal unread FreshRSS entry per matched source.',
+			. 'living overview followed by one normal unread FreshRSS entry per matched source. Mark read stores matches '
+			. 'for Restore and statistics but creates no feed unless verification is enabled.',
+		'show_verification' => 'Show a verification feed in Topic Digests',
+		'show_verification_help' => 'Create a living digest solely to inspect matches and use Restore controls. '
+			. 'Matching originals are still marked read.',
 		'description' => 'What belongs in this topic?',
-		'description_help' => 'Describe concrete events to include. This text is also shown in the synthetic feed.',
+		'description_help' => 'Describe concrete events to include. This text is also shown in the synthetic feed when one is enabled.',
 		'exclusions' => 'Exclusions',
 		'exclusions_help' => 'One exclusion per line. Restored items can propose additions here.',
 		'feed_behaviour' => 'Matching source articles are marked read. Restore returns a source to the unread stream '
 			. 'and proposes an exclusion for approval; the written rule is never changed automatically.',
 		'high_priority_feed_behaviour' => 'A living event overview stays first, followed by each match as a normal unread '
 			. 'article. The original source is marked read only after the topic copy and overview are stored successfully.',
+		'mark_read_feed_behaviour' => 'This optional verification digest lists articles automatically marked read by '
+			. 'the topic rule. Restore returns a source to the unread stream and blocks that match from this topic.',
 		'restore' => 'Restore',
 		'restore_all' => 'Restore all',
 		'why_matched' => 'Why it matched',

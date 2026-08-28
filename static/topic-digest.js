@@ -61,9 +61,12 @@
 		for (const feedId of Object.keys(settings.feed_counts || {})) {
 			const feed = document.getElementById(`f_${feedId}`);
 			if (!feed) continue;
-			const isLowPriority = (feedTypes[feedId] || 'digest') === 'digest';
-			ensureMarker(feed.querySelector(':scope > .item-title > .title'), isLowPriority ? '🗂️' : '⚡',
-				isLowPriority ? 'Low-priority living digest' : 'High-priority topic feed');
+			const feedType = feedTypes[feedId] || 'digest';
+			const isLowPriority = feedType !== 'feed';
+			const marker = feedType === 'feed' ? ['⚡', 'High-priority topic feed']
+				: feedType === 'mark_read' ? ['✓', 'Mark-read verification feed']
+				: ['🗂️', 'Low-priority living digest'];
+			ensureMarker(feed.querySelector(':scope > .item-title > .title'), marker[0], marker[1]);
 			feed.classList.toggle('topic-digest-always-visible', alwaysShowTopics);
 			if (!alwaysShowTopics) continue;
 			activeLowPriorityTopic ||= isLowPriority && feed.classList.contains('active');
@@ -105,6 +108,13 @@
 		const updateDays = () => { if (days) days.hidden = mode?.value !== 'days'; };
 		mode?.addEventListener('change', updateDays);
 		updateDays();
+		const topicType = document.getElementById('topic_type');
+		const verification = document.querySelector('[data-mark-read-verification]');
+		const updateVerification = () => {
+			if (verification) verification.hidden = topicType?.value !== 'mark_read';
+		};
+		topicType?.addEventListener('change', updateVerification);
+		updateVerification();
 	};
 	document.addEventListener('freshrss:globalContextLoaded', configureCategoryLink, {once: true});
 	if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initialise, {once: true});

@@ -3,7 +3,8 @@
 declare(strict_types=1);
 
 define('TOPIC_DIGEST_WORKER', true);
-require dirname(__DIR__, 3) . '/cli/_cli.php';
+require_once __DIR__ . '/bootstrap.php';
+topicDigestLoadFreshRssCli();
 
 $options = getopt('', ['user:', 'limit:']);
 $username = is_string($options['user'] ?? null) ? $options['user'] : '';

@@ -56,6 +56,24 @@ final class TopicDigestTest extends TestCase {
 		self::assertSame('digest', $this->store->topic($id)['topic_type']);
 	}
 
+	public function testTopicCanMarkMatchesReadWithoutAFeedOrExposeVerification(): void {
+		$id = $this->store->saveTopic([
+			'name' => 'Routine updates', 'description' => 'Routine product updates.',
+			'enabled' => true, 'all_feeds' => true, 'topic_type' => 'mark_read',
+		]);
+		$topic = $this->store->topic($id);
+		self::assertSame('mark_read', $topic['topic_type']);
+		self::assertFalse($topic['show_verification']);
+
+		$topic['show_verification'] = true;
+		$this->store->saveTopic($topic, $id);
+		self::assertTrue($this->store->topic($id)['show_verification']);
+		$topic = $this->store->topic($id);
+		$topic['topic_type'] = 'digest';
+		$this->store->saveTopic($topic, $id);
+		self::assertFalse($this->store->topic($id)['show_verification']);
+	}
+
 	public function testQueueIsIdempotentAndPipelineChangesRequeue(): void {
 		$entry = new FreshRSS_Entry(4, 'guid', 'Model released', '', 'Detailed release announcement.',
 			'https://example.com/model', 1_700_000_000);

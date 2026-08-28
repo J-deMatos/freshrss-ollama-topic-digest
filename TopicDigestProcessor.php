@@ -29,8 +29,10 @@ final class TopicDigestProcessor {
 		$processed = 0;
 		$failed = 0;
 		$scanned = 0;
-		while (!$this->store->isPaused() && $this->store->backfill()['active']) {
-			$count = $this->extension->enqueueBackfillPage(1000);
+		$status = $this->store->status();
+		if (!$this->store->isPaused() && $this->store->backfill()['active']
+				&& (int)$status['queued'] < max(20, $limit * 2)) {
+			$count = $this->extension->enqueueBackfillPage(20);
 			$scanned += $count;
 			if ($count === 0 && $this->store->backfill()['active']) {
 				throw new RuntimeException('Topic Digest archive scan did not advance.');
@@ -222,7 +224,7 @@ final class TopicDigestProcessor {
 			}
 			if ($topic['topic_type'] === 'feed') {
 				$this->extension->materialiseTopicSource((int)$topic['id'], $entry->id(), $result['new_event']);
-			} else {
+			} elseif ($topic['topic_type'] === 'digest' || (bool)$topic['show_verification']) {
 				$this->extension->synchroniseTopic((int)$topic['id'], $result['new_event']);
 			}
 			$matched = true;

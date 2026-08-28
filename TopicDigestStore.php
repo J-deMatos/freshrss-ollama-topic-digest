@@ -37,6 +37,7 @@ final class TopicDigestStore {
 				backfill_mode TEXT NOT NULL DEFAULT 'days',
 				backfill_days INTEGER NOT NULL DEFAULT 90,
 				topic_type TEXT NOT NULL DEFAULT 'digest',
+				show_verification INTEGER NOT NULL DEFAULT 0,
 				feed_id INTEGER,
 				entry_id TEXT,
 				description_embedding TEXT,
@@ -177,6 +178,9 @@ final class TopicDigestStore {
 		if (!$this->hasColumn('topics', 'topic_type')) {
 			$this->pdo->exec("ALTER TABLE topics ADD COLUMN topic_type TEXT NOT NULL DEFAULT 'digest'");
 		}
+		if (!$this->hasColumn('topics', 'show_verification')) {
+			$this->pdo->exec('ALTER TABLE topics ADD COLUMN show_verification INTEGER NOT NULL DEFAULT 0');
+		}
 		foreach (['title' => "''", 'explanation' => "''", 'embedding' => "'[]'"] as $column => $default) {
 			if (!$this->hasColumn('rejections', $column)) {
 				$this->pdo->exec("ALTER TABLE rejections ADD COLUMN {$column} TEXT NOT NULL DEFAULT {$default}");
@@ -191,7 +195,7 @@ final class TopicDigestStore {
 			$this->setMeta('processing_metrics_revision', '2');
 			$this->setMeta('processing_metrics_sample_revision', '0');
 		}
-		$this->pdo->exec('PRAGMA user_version = 5');
+		$this->pdo->exec('PRAGMA user_version = 6');
 	}
 
 	/** @param array<string,mixed> $values */
@@ -210,8 +214,9 @@ final class TopicDigestStore {
 		$categories = $this->idList(is_array($values['category_ids'] ?? null) ? $values['category_ids'] : []);
 		$mode = in_array($values['backfill_mode'] ?? '', ['days', 'all', 'future'], true)
 			? (string)$values['backfill_mode'] : 'days';
-		$topicType = in_array($values['topic_type'] ?? '', ['digest', 'feed'], true)
+		$topicType = in_array($values['topic_type'] ?? '', ['digest', 'feed', 'mark_read'], true)
 			? (string)$values['topic_type'] : 'digest';
+		$showVerification = $topicType === 'mark_read' && !empty($values['show_verification']) ? 1 : 0;
 		$rawConfidence = $values['confidence'] ?? 0.85;
 		if (!is_numeric($rawConfidence) || (float)$rawConfidence < 0.0 || (float)$rawConfidence > 1.0) {
 			throw new InvalidArgumentException('Topic confidence must be a number between 0 and 1.');
@@ -223,12 +228,12 @@ final class TopicDigestStore {
 			$name, $description, json_encode($exclusions, JSON_THROW_ON_ERROR), !empty($values['enabled']) ? 1 : 0,
 			$confidence, !empty($values['all_feeds']) ? 1 : 0, !empty($values['all_categories']) ? 1 : 0,
 			json_encode($feeds, JSON_THROW_ON_ERROR), json_encode($categories, JSON_THROW_ON_ERROR),
-			$mode, $days, $topicType, $hash,
+			$mode, $days, $topicType, $showVerification, $hash,
 		];
 		if ($id === null) {
 			$statement = $this->pdo->prepare('INSERT INTO topics(name,description,exclusions,enabled,confidence,'
-				. 'all_feeds,all_categories,feed_ids,category_ids,backfill_mode,backfill_days,topic_type,rule_hash,created_at,updated_at) '
-				. 'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)');
+				. 'all_feeds,all_categories,feed_ids,category_ids,backfill_mode,backfill_days,topic_type,show_verification,'
+				. 'rule_hash,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)');
 			$statement->execute([...$params, $now, $now]);
 			return (int)$this->pdo->lastInsertId();
 		}
@@ -237,8 +242,8 @@ final class TopicDigestStore {
 			throw new InvalidArgumentException('Unknown topic.');
 		}
 		$statement = $this->pdo->prepare('UPDATE topics SET name=?,description=?,exclusions=?,enabled=?,confidence=?,'
-			. 'all_feeds=?,all_categories=?,feed_ids=?,category_ids=?,backfill_mode=?,backfill_days=?,topic_type=?,rule_hash=?,'
-			. 'description_embedding=?,updated_at=? WHERE id=?');
+			. 'all_feeds=?,all_categories=?,feed_ids=?,category_ids=?,backfill_mode=?,backfill_days=?,topic_type=?,'
+			. 'show_verification=?,rule_hash=?,description_embedding=?,updated_at=? WHERE id=?');
 		$embedding = hash_equals((string)$existing['rule_hash'], $hash) ? $existing['description_embedding'] : null;
 		$statement->execute([...$params, $embedding, $now, $id]);
 		return $id;
@@ -267,7 +272,7 @@ final class TopicDigestStore {
 			$decoded = json_decode((string)$row[$key], true);
 			$row[$key] = is_array($decoded) ? $decoded : [];
 		}
-		foreach (['enabled', 'all_feeds', 'all_categories'] as $key) {
+		foreach (['enabled', 'all_feeds', 'all_categories', 'show_verification'] as $key) {
 			$row[$key] = (bool)$row[$key];
 		}
 		$row['event_count'] = (int)($row['event_count'] ?? 0);

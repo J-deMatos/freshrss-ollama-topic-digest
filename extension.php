@@ -89,6 +89,13 @@ final class TopicDigestExtension extends Minz_Extension {
 				$feedId = (int)($topic['feed_id'] ?? 0);
 				$entryId = (string)($topic['entry_id'] ?? '');
 				$feed = $feedId > 0 ? $feedDao->searchById($feedId) : null;
+				$shouldMaterialise = $this->topicHasSyntheticFeed($topic);
+				if (!$shouldMaterialise) {
+					if ($feedId > 0 || $entryId !== '') {
+						$this->synchroniseTopic((int)$topic['id'], false);
+					}
+					continue;
+				}
 				$overviewEntryMissing = $entryId === '' || $entryDao->searchById($entryId) === null;
 				$feedTopicAttributes = $feed?->attributeArray('topic_digest') ?? [];
 				if ($feedId < 1 || $feed === null || $overviewEntryMissing
@@ -149,6 +156,7 @@ final class TopicDigestExtension extends Minz_Extension {
 		$topics = array_map(static fn(array $topic): array => [
 			$topic['id'], $topic['rule_hash'], $topic['enabled'], $topic['all_feeds'], $topic['all_categories'],
 			$topic['feed_ids'], $topic['category_ids'], $topic['backfill_mode'], $topic['backfill_days'], $topic['topic_type'],
+			$topic['show_verification'],
 		], $this->store()->topics());
 		return hash('sha256', json_encode([$config['summary_model'], $config['judge_model'],
 			$config['embedding_model'], $config['scraping'], $this->store()->pipelineRevision(), $topics], JSON_THROW_ON_ERROR));
@@ -244,24 +252,28 @@ final class TopicDigestExtension extends Minz_Extension {
 		if (!$backfill['active']) {
 			return 0;
 		}
-		$entries = iterator_to_array(FreshRSS_Factory::createEntryDao()->listWhere(
-			id_max: $backfill['cursor'], sort: 'id', order: 'DESC', limit: max(1, min(1000, $pageSize))
-		), false);
-		if ($entries === []) {
-			$this->store()->advanceBackfill($backfill['cursor'], false);
-			return 0;
+		$limit = max(1, min(100, $pageSize));
+		$feedCategories = [];
+		foreach (FreshRSS_Factory::createFeedDao()->selectAll() as $feed) {
+			$feedCategories[(int)$feed['id']] = (int)$feed['category'];
 		}
 		$count = 0;
+		$lastId = null;
 		$pipelineHash = $this->pipelineHash();
-		foreach ($entries as $entry) {
+		foreach (FreshRSS_Factory::createEntryDao()->listWhere(
+				id_max: $backfill['cursor'], sort: 'id', order: 'DESC', limit: $limit) as $entry) {
+			$lastId = $entry->id();
 			if (!$this->isSyntheticFeed($entry->feedId())) {
-				$this->store()->enqueue($entry, $entry->feed()?->categoryId() ?? 0, $pipelineHash, 10, archive: true);
+				$this->store()->enqueue($entry, $feedCategories[$entry->feedId()] ?? 0, $pipelineHash, 10, archive: true);
 			}
 			$count++;
 		}
-		$last = end($entries);
-		$cursor = $last instanceof FreshRSS_Entry ? self::previousNumericString($last->id()) : $backfill['cursor'];
-		$this->store()->advanceBackfill($cursor, count($entries) === max(1, min(1000, $pageSize)));
+		if ($count === 0) {
+			$this->store()->advanceBackfill($backfill['cursor'], false);
+			return 0;
+		}
+		$cursor = $lastId === null ? $backfill['cursor'] : self::previousNumericString($lastId);
+		$this->store()->advanceBackfill($cursor, $count === $limit);
 		return $count;
 	}
 
@@ -282,11 +294,20 @@ final class TopicDigestExtension extends Minz_Extension {
 		if ($topic === null) {
 			throw new InvalidArgumentException('Unknown topic.');
 		}
-		$categoryId = $this->ensureCategory();
 		$feedDao = FreshRSS_Factory::createFeedDao();
 		$syntheticUrl = 'https://topic-digest.invalid/topic/' . $topicId;
 		$feed = (int)($topic['feed_id'] ?? 0) > 0 ? $feedDao->searchById((int)$topic['feed_id']) : null;
 		$feed ??= $feedDao->searchByUrl($syntheticUrl);
+		if (!$this->topicHasSyntheticFeed($topic)) {
+			if ($feed !== null && !FreshRSS_feed_Controller::deleteFeed($feed->id())) {
+				throw new RuntimeException('Could not remove the hidden mark-read verification feed.');
+			}
+			$this->store()->attachSynthetic($topicId, null, null);
+			$this->syntheticFeedIds = null;
+			FreshRSS_UserDAO::touch();
+			return;
+		}
+		$categoryId = $this->ensureCategory();
 		$description = $this->feedDescription($topic);
 		$feedTopicAttributes = $feed?->attributeArray('topic_digest') ?? [];
 		$currentType = (string)($feedTopicAttributes['topic_type'] ?? 'digest');
@@ -353,6 +374,11 @@ final class TopicDigestExtension extends Minz_Extension {
 		$feedDao->updateCachedValues($feedId);
 		FreshRSS_UserDAO::touch();
 		$this->syntheticFeedIds = null;
+	}
+
+	/** @param array<string,mixed> $topic */
+	private function topicHasSyntheticFeed(array $topic): bool {
+		return $topic['topic_type'] !== 'mark_read' || (bool)$topic['show_verification'];
 	}
 
 	/** @param array<string,mixed> $topic */
@@ -581,9 +607,11 @@ final class TopicDigestExtension extends Minz_Extension {
 		if ($topic['exclusions'] !== []) {
 			$text .= "\n\n" . _t('ext.topic_digest.exclusions') . ': ' . implode('; ', $topic['exclusions']);
 		}
-		$behaviour = $topic['topic_type'] === 'feed'
-			? _t('ext.topic_digest.high_priority_feed_behaviour')
-			: _t('ext.topic_digest.feed_behaviour');
+		$behaviour = match ($topic['topic_type']) {
+			'feed' => _t('ext.topic_digest.high_priority_feed_behaviour'),
+			'mark_read' => _t('ext.topic_digest.mark_read_feed_behaviour'),
+			default => _t('ext.topic_digest.feed_behaviour'),
+		};
 		return $text . "\n\n" . $behaviour;
 	}
 
@@ -905,6 +933,7 @@ final class TopicDigestExtension extends Minz_Extension {
 				'backfill_mode' => Minz_Request::paramString('backfill_mode', plaintext: true),
 				'backfill_days' => Minz_Request::paramInt('backfill_days'),
 				'topic_type' => Minz_Request::paramString('topic_type', plaintext: true),
+				'show_verification' => Minz_Request::paramBoolean('show_verification'),
 			];
 			$topicId = $this->store()->saveTopic($values, $id > 0 ? $id : null);
 			$this->store()->startBackfill();

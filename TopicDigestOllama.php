@@ -1,6 +1,17 @@
 <?php
 declare(strict_types=1);
 
+final class TopicDigestOllamaHttpException extends RuntimeException {
+	public function __construct(
+		public readonly int $status,
+		public readonly ?int $retryAfter,
+		public readonly bool $cloudRequest,
+		string $message,
+	) {
+		parent::__construct($message);
+	}
+}
+
 final class TopicDigestOllama {
 	private const MAX_RESPONSE_BYTES = 2_000_000;
 	/** @var (Closure(string,string,array<string,mixed>|null):array<string,mixed>)|null */
@@ -283,10 +294,25 @@ final class TopicDigestOllama {
 			throw new RuntimeException('Cannot initialise the Ollama request.');
 		}
 		$body = '';
+		$retryAfter = null;
 		$options = [
 			CURLOPT_CUSTOMREQUEST => $method, CURLOPT_RETURNTRANSFER => false,
 			CURLOPT_CONNECTTIMEOUT => min(10, $this->timeout), CURLOPT_TIMEOUT => $this->timeout,
 			CURLOPT_HTTPHEADER => ['Accept: application/json', 'Content-Type: application/json'],
+			CURLOPT_HEADERFUNCTION => static function ($curl, string $header) use (&$retryAfter): int {
+				if (preg_match('/^Retry-After:\s*(.+?)\s*$/i', $header, $matches) === 1) {
+					$value = trim($matches[1]);
+					if (ctype_digit($value)) {
+						$retryAfter = max(0, (int)$value);
+					} else {
+						$timestamp = strtotime($value);
+						if ($timestamp !== false) {
+							$retryAfter = max(0, $timestamp - time());
+						}
+					}
+				}
+				return strlen($header);
+			},
 			CURLOPT_WRITEFUNCTION => static function ($curl, string $chunk) use (&$body): int {
 				if (strlen($body) + strlen($chunk) > self::MAX_RESPONSE_BYTES) {
 					return 0;
@@ -301,10 +327,29 @@ final class TopicDigestOllama {
 		curl_setopt_array($handle, $options);
 		$ok = curl_exec($handle);
 		$status = (int)curl_getinfo($handle, CURLINFO_HTTP_CODE);
+		$curlErrorNumber = curl_errno($handle);
 		$error = curl_error($handle);
 		curl_close($handle);
 		if ($ok === false || $status < 200 || $status >= 300) {
-			throw new RuntimeException('Ollama request failed' . ($error === '' ? '.' : ': ' . $error));
+			$responseError = '';
+			try {
+				$decodedError = json_decode($body, true, flags: JSON_THROW_ON_ERROR);
+				if (is_array($decodedError) && is_string($decodedError['error'] ?? null)) {
+					$responseError = trim($decodedError['error']);
+				}
+			} catch (JsonException) {
+				// Preserve the HTTP failure; invalid error bodies are not response payloads to repair.
+			}
+			$model = is_array($payload) && is_string($payload['model'] ?? null) ? $payload['model'] : '';
+			$plainBody = preg_replace('/\s+/u', ' ', trim($body)) ?? '';
+			$detail = $responseError !== '' ? $responseError
+				: ($error !== '' ? $error : ($plainBody !== '' ? $plainBody : 'empty response'));
+			$message = "Ollama {$method} {$path} failed"
+				. ($model === '' ? '' : " for model {$model}")
+				. "; HTTP {$status}; cURL {$curlErrorNumber}; response bytes " . strlen($body)
+				. ($retryAfter === null ? '' : "; Retry-After {$retryAfter}s")
+				. ': ' . mb_substr($detail, 0, 1000);
+			throw new TopicDigestOllamaHttpException($status, $retryAfter, $this->isCloudModel($model), $message);
 		}
 		try {
 			$result = json_decode($body, true, flags: JSON_THROW_ON_ERROR);

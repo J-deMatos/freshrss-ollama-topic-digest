@@ -6,10 +6,14 @@ require_once __DIR__ . '/ArticleSummaryCache.php';
 require_once __DIR__ . '/TopicDigestOllama.php';
 require_once __DIR__ . '/TopicDigestScraper.php';
 require_once __DIR__ . '/TopicDigestProcessor.php';
+require_once __DIR__ . '/TopicDigestCloudConcurrency.php';
+require_once __DIR__ . '/TopicDigestCoordinator.php';
 
 /**
- * @phpstan-type TopicDigestConfig array{ollama_url:string,summary_model:string,judge_model:string,
- *  embedding_model:string,timeout:int,scraping:bool,always_show_topics:bool}
+ * @phpstan-type TopicDigestConfig array{ollama_url:string,model_profile:string,summary_model:string,
+ *  judge_model:string,embedding_model:string,local_summary_model:string,local_judge_model:string,
+ *  local_embedding_model:string,cloud_summary_model:string,cloud_judge_model:string,cloud_embedding_model:string,
+ *  timeout:int,scraping:bool,always_show_topics:bool,cloud_concurrency:string}
  */
 final class TopicDigestExtension extends Minz_Extension {
 	private const CATEGORY_NAME = 'Topic Digests';
@@ -74,7 +78,7 @@ final class TopicDigestExtension extends Minz_Extension {
 		Minz_View::appendScript($this->getFileUrl('topic-digest.js'), false, true, false);
 		Minz_View::appendStyle($this->getFileUrl('status.css'));
 		Minz_View::appendScript($this->getFileUrl('status.js'), false, true, false);
-		if (Minz_Request::paramString('topic_digest_action') !== 'stats') {
+		if (!defined('TOPIC_DIGEST_CHILD_WORKER') && Minz_Request::paramString('topic_digest_action') !== 'stats') {
 			$this->store()->ensureClassifierRevision('topic-context-v2');
 			$this->reconcileMissingTopics();
 			$this->launchAutomaticWorker();
@@ -86,22 +90,28 @@ final class TopicDigestExtension extends Minz_Extension {
 			$feedDao = FreshRSS_Factory::createFeedDao();
 			$entryDao = FreshRSS_Factory::createEntryDao();
 			foreach ($this->store()->topics() as $topic) {
-				$feedId = (int)($topic['feed_id'] ?? 0);
-				$entryId = (string)($topic['entry_id'] ?? '');
-				$feed = $feedId > 0 ? $feedDao->searchById($feedId) : null;
-				$shouldMaterialise = $this->topicHasSyntheticFeed($topic);
-				if (!$shouldMaterialise) {
-					if ($feedId > 0 || $entryId !== '') {
+				$topicLock = $this->acquireTopicLock((int)$topic['id']);
+				try {
+					$feedId = (int)($topic['feed_id'] ?? 0);
+					$entryId = (string)($topic['entry_id'] ?? '');
+					$feed = $feedId > 0 ? $feedDao->searchById($feedId) : null;
+					$shouldMaterialise = $this->topicHasSyntheticFeed($topic);
+					if (!$shouldMaterialise) {
+						if ($feedId > 0 || $entryId !== '') {
+							$this->synchroniseTopic((int)$topic['id'], false);
+						}
+						continue;
+					}
+					$overviewEntryMissing = $entryId === '' || $entryDao->searchById($entryId) === null;
+					$feedTopicAttributes = $feed?->attributeArray('topic_digest') ?? [];
+					if ($feedId < 1 || $feed === null || $overviewEntryMissing
+							|| $feed->priority() !== FreshRSS_Feed::PRIORITY_CATEGORY
+							|| ($feedTopicAttributes['topic_type'] ?? null) !== $topic['topic_type']) {
 						$this->synchroniseTopic((int)$topic['id'], false);
 					}
-					continue;
-				}
-				$overviewEntryMissing = $entryId === '' || $entryDao->searchById($entryId) === null;
-				$feedTopicAttributes = $feed?->attributeArray('topic_digest') ?? [];
-				if ($feedId < 1 || $feed === null || $overviewEntryMissing
-						|| $feed->priority() !== FreshRSS_Feed::PRIORITY_CATEGORY
-						|| ($feedTopicAttributes['topic_type'] ?? null) !== $topic['topic_type']) {
-					$this->synchroniseTopic((int)$topic['id'], false);
+				} finally {
+					flock($topicLock, LOCK_UN);
+					fclose($topicLock);
 				}
 			}
 		} catch (Throwable $e) {
@@ -132,15 +142,49 @@ final class TopicDigestExtension extends Minz_Extension {
 
 	/** @return TopicDigestConfig */
 	public function configuration(): array {
+		$legacySummary = $this->getUserConfigurationString('summary_model');
+		$legacyJudge = $this->getUserConfigurationString('judge_model');
+		$legacyEmbedding = $this->getUserConfigurationString('embedding_model');
+		$legacyIsCloud = $legacySummary !== null && $legacyJudge !== null
+			&& str_ends_with($legacySummary, ':cloud') && str_ends_with($legacyJudge, ':cloud');
+		$profile = $this->getUserConfigurationString('model_profile');
+		if (!in_array($profile, ['local', 'cloud'], true)) {
+			$profile = $legacyIsCloud ? 'cloud' : 'local';
+		}
+		$localSummary = $this->getUserConfigurationString('local_summary_model')
+			?? (!$legacyIsCloud && $legacySummary !== null ? $legacySummary : 'qwen3.5:4b');
+		$localJudge = $this->getUserConfigurationString('local_judge_model')
+			?? (!$legacyIsCloud && $legacyJudge !== null ? $legacyJudge : 'qwen3.5:9b');
+		$localEmbedding = $this->getUserConfigurationString('local_embedding_model')
+			?? $legacyEmbedding ?? 'qwen3-embedding:0.6b';
+		$cloudSummary = $this->getUserConfigurationString('cloud_summary_model')
+			?? ($legacyIsCloud && $legacySummary !== null ? $legacySummary : 'gpt-oss:20b-cloud');
+		$cloudJudge = $this->getUserConfigurationString('cloud_judge_model')
+			?? ($legacyIsCloud && $legacyJudge !== null ? $legacyJudge : 'gpt-oss:20b-cloud');
+		$cloudEmbedding = $this->getUserConfigurationString('cloud_embedding_model')
+			?? $legacyEmbedding ?? 'qwen3-embedding:0.6b';
 		return [
 			'ollama_url' => $this->getUserConfigurationString('ollama_url') ?? 'http://ollama:11434',
-			'summary_model' => $this->getUserConfigurationString('summary_model') ?? 'qwen3.5:4b',
-			'judge_model' => $this->getUserConfigurationString('judge_model') ?? 'qwen3.5:9b',
-			'embedding_model' => $this->getUserConfigurationString('embedding_model') ?? 'qwen3-embedding:0.6b',
+			'model_profile' => $profile,
+			'summary_model' => $profile === 'cloud' ? $cloudSummary : $localSummary,
+			'judge_model' => $profile === 'cloud' ? $cloudJudge : $localJudge,
+			'embedding_model' => $profile === 'cloud' ? $cloudEmbedding : $localEmbedding,
+			'local_summary_model' => $localSummary,
+			'local_judge_model' => $localJudge,
+			'local_embedding_model' => $localEmbedding,
+			'cloud_summary_model' => $cloudSummary,
+			'cloud_judge_model' => $cloudJudge,
+			'cloud_embedding_model' => $cloudEmbedding,
 			'timeout' => $this->ollamaTimeoutConfiguration(),
 			'scraping' => $this->getUserConfigurationBool('scraping') ?? true,
 			'always_show_topics' => $this->getUserConfigurationBool('always_show_topics') ?? true,
+			'cloud_concurrency' => $this->cloudConcurrencyConfiguration(),
 		];
+	}
+
+	private function cloudConcurrencyConfiguration(): string {
+		$value = $this->getUserConfigurationString('cloud_concurrency') ?? 'auto';
+		return in_array($value, ['auto', '1', '2', '4', '8', '16'], true) ? $value : 'auto';
 	}
 
 	private function ollamaTimeoutConfiguration(): int {
@@ -172,12 +216,35 @@ final class TopicDigestExtension extends Minz_Extension {
 		return $this->getExtensionUserPath() . '/worker.lock';
 	}
 
+	/** @param (Closure():void)|null $heartbeat @return resource */
+	public function acquireTopicLock(int $topicId, ?Closure $heartbeat = null) {
+		$lock = fopen($this->getExtensionUserPath() . '/topic-' . $topicId . '.lock', 'c');
+		if ($lock === false) {
+			throw new RuntimeException('Cannot acquire the Topic Digest topic lock.');
+		}
+		try {
+			$lastHeartbeat = hrtime(true);
+			while (!flock($lock, LOCK_EX | LOCK_NB)) {
+				if ($heartbeat !== null && hrtime(true) - $lastHeartbeat >= 30_000_000_000) {
+					$heartbeat();
+					$lastHeartbeat = hrtime(true);
+				}
+				usleep(100000);
+			}
+		} catch (Throwable $e) {
+			fclose($lock);
+			throw $e;
+		}
+		return $lock;
+	}
+
 	public function enqueueEntry(FreshRSS_Entry $entry): FreshRSS_Entry {
 		if ($this->isSyntheticFeed($entry->feedId()) || $this->store()->topics(true) === []) {
 			return $entry;
 		}
 		try {
-			$this->store()->enqueue($entry, $entry->feed()?->categoryId() ?? 0, $this->pipelineHash(), 100, 30);
+			$this->store()->enqueue($entry, $entry->feed()?->categoryId() ?? 0, $this->pipelineHash(),
+				TopicDigestStore::livePriority(), 0);
 			$this->launchAutomaticWorker();
 		} catch (Throwable $e) {
 			Minz_Log::error('Topic Digest queue error: ' . $e->getMessage());
@@ -719,18 +786,30 @@ final class TopicDigestExtension extends Minz_Extension {
 
 	/** @return list<string> */
 	public function restoreSource(int $topicId, string $entryId): array {
-		$ids = $this->store()->restoreSource($topicId, $entryId);
-		$this->markUnread($ids);
-		$this->synchroniseTopic($topicId, false, true);
-		return $ids;
+		$topicLock = $this->acquireTopicLock($topicId);
+		try {
+			$ids = $this->store()->restoreSource($topicId, $entryId);
+			$this->markUnread($ids);
+			$this->synchroniseTopic($topicId, false, true);
+			return $ids;
+		} finally {
+			flock($topicLock, LOCK_UN);
+			fclose($topicLock);
+		}
 	}
 
 	/** @return list<string> */
 	public function restoreEvent(int $topicId, int $eventId): array {
-		$ids = $this->store()->restoreEvent($topicId, $eventId);
-		$this->markUnread($ids);
-		$this->synchroniseTopic($topicId, false, true);
-		return $ids;
+		$topicLock = $this->acquireTopicLock($topicId);
+		try {
+			$ids = $this->store()->restoreEvent($topicId, $eventId);
+			$this->markUnread($ids);
+			$this->synchroniseTopic($topicId, false, true);
+			return $ids;
+		} finally {
+			flock($topicLock, LOCK_UN);
+			fclose($topicLock);
+		}
 	}
 
 	/** @param list<string> $ids */
@@ -807,6 +886,7 @@ final class TopicDigestExtension extends Minz_Extension {
 	 */
 	private function formattedStatistics(): array {
 		$status = $this->store()->status();
+		$status['backfill_remaining'] = $this->backfillRemainingCount();
 		$paused = (int)$status['paused'] !== 0;
 		return [
 			'summary' => _t('ext.topic_digest.stats_summary', (int)$status['queued'], (int)$status['processed']),
@@ -818,7 +898,12 @@ final class TopicDigestExtension extends Minz_Extension {
 					'value' => (string)(int)$status['processed']],
 				'events' => ['label' => _t('ext.topic_digest.events'), 'value' => (string)(int)$status['events']],
 				'sources' => ['label' => _t('ext.topic_digest.sources'), 'value' => (string)(int)$status['sources']],
-				'average_speed' => ['label' => _t('ext.topic_digest.average_speed'),
+				'last_hour_average_speed' => ['label' => _t('ext.topic_digest.last_hour_average_speed'),
+					'value' => (int)$status['last_hour_average_ready'] !== 0
+						? _t('ext.topic_digest.articles_per_hour',
+							number_format((float)$status['last_hour_average_per_hour'], 1))
+						: _t('ext.topic_digest.estimate_calculating')],
+				'all_time_average_speed' => ['label' => _t('ext.topic_digest.all_time_average_speed'),
 					'value' => (int)$status['average_ready'] !== 0
 						? _t('ext.topic_digest.articles_per_hour', number_format((float)$status['average_per_hour'], 1))
 						: _t('ext.topic_digest.estimate_calculating')],
@@ -837,20 +922,39 @@ final class TopicDigestExtension extends Minz_Extension {
 		if ((int)($status['paused'] ?? 0) !== 0) {
 			return _t('ext.topic_digest.estimate_paused');
 		}
-		if ((int)($status['queued'] ?? 0) === 0 && (int)($status['backfill_active'] ?? 0) === 0) {
+		$remaining = TopicDigestProcessor::estimatedRemainingArticles($status);
+		if ($remaining === 0 && (int)($status['backfill_active'] ?? 0) === 0) {
 			return _t('ext.topic_digest.estimate_complete');
 		}
-		$rate = (float)($status['average_per_hour'] ?? 0.0);
-		if ((int)($status['backfill_active'] ?? 0) !== 0 || $rate <= 0.0) {
+		$rate = (int)($status['last_hour_average_ready'] ?? 0) !== 0
+			? (float)($status['last_hour_average_per_hour'] ?? 0.0)
+			: (float)($status['average_per_hour'] ?? 0.0);
+		if ($remaining === null || $rate <= 0.0) {
 			return _t('ext.topic_digest.estimate_calculating');
 		}
-		$minutes = max(1, (int)ceil(((int)$status['queued'] / $rate) * 60));
+		$minutes = max(1, (int)ceil(($remaining / $rate) * 60));
 		$days = intdiv($minutes, 1440);
 		$hours = intdiv($minutes % 1440, 60);
 		$remainingMinutes = $minutes % 60;
 		$duration = $days > 0 ? "{$days}d {$hours}h"
 			: ($hours > 0 ? "{$hours}h {$remainingMinutes}min" : "{$remainingMinutes}min");
 		return _t('ext.topic_digest.estimated_duration', $duration);
+	}
+
+	private function backfillRemainingCount(): int {
+		$backfill = $this->store()->backfill();
+		if (!$backfill['active']) {
+			return 0;
+		}
+		$entryDao = FreshRSS_Factory::createEntryDao();
+		if ($backfill['cursor'] === '99999999999999999999') {
+			return $entryDao->count();
+		}
+		$count = $entryDao->fetchInt(
+			'SELECT COUNT(*) FROM `_entry` WHERE id <= :id_max',
+			[':id_max' => $backfill['cursor']]
+		);
+		return $count ?? -1;
 	}
 
 	#[\Override]
@@ -865,10 +969,14 @@ final class TopicDigestExtension extends Minz_Extension {
 			$this->handlePost(Minz_Request::paramString('topic_digest_action'));
 		}
 		foreach ($this->store()->topics() as $topic) {
+			$topicLock = $this->acquireTopicLock((int)$topic['id']);
 			try {
 				$this->synchroniseTopic((int)$topic['id'], false);
 			} catch (Throwable $e) {
 				Minz_Log::error('Topic Digest reconciliation error: ' . $e->getMessage());
+			} finally {
+				flock($topicLock, LOCK_UN);
+				fclose($topicLock);
 			}
 		}
 		$this->settings = $this->configuration();
@@ -899,22 +1007,55 @@ final class TopicDigestExtension extends Minz_Extension {
 		} elseif ($action === 'save_settings') {
 			$previousConfig = $this->configuration();
 			$url = rtrim(Minz_Request::paramString('ollama_url', plaintext: true), '/');
-			$models = [Minz_Request::paramString('summary_model', plaintext: true),
-				Minz_Request::paramString('judge_model', plaintext: true), Minz_Request::paramString('embedding_model', plaintext: true)];
-			if (!$this->validOllamaUrl($url) || count(array_filter($models, [$this, 'validModelName'])) !== 3) {
+			$profile = Minz_Request::paramString('model_profile', plaintext: true);
+			$modelFields = ['local_summary_model', 'local_judge_model', 'local_embedding_model',
+				'cloud_summary_model', 'cloud_judge_model', 'cloud_embedding_model'];
+			$models = [];
+			foreach ($modelFields as $field) {
+				$models[$field] = trim(Minz_Request::paramString($field, plaintext: true));
+			}
+			if (!$this->validOllamaUrl($url) || !in_array($profile, ['local', 'cloud'], true)
+					|| count(array_filter($models, [$this, 'validModelName'])) !== count($models)) {
 				Minz_Request::bad('Invalid Ollama URL or model name.');
 			}
+			$prefix = $profile . '_';
 			/** @phpstan-ignore method.deprecated */
-			$this->setUserConfiguration(['ollama_url' => $url, 'summary_model' => trim($models[0]),
-				'judge_model' => trim($models[1]), 'embedding_model' => trim($models[2]),
+			$this->setUserConfiguration(['ollama_url' => $url, 'model_profile' => $profile,
+				...$models,
+				'summary_model' => $models[$prefix . 'summary_model'],
+				'judge_model' => $models[$prefix . 'judge_model'],
+				'embedding_model' => $models[$prefix . 'embedding_model'],
 				'timeout' => min(self::MAX_OLLAMA_TIMEOUT, max(10, Minz_Request::paramInt('timeout'))),
 				'scraping' => Minz_Request::paramBoolean('scraping'),
-				'always_show_topics' => $previousConfig['always_show_topics']]);
-			if (!hash_equals($previousConfig['embedding_model'], trim($models[2]))) {
+				'always_show_topics' => $previousConfig['always_show_topics'],
+				'cloud_concurrency' => $this->validCloudConcurrency(
+					Minz_Request::paramString('cloud_concurrency', plaintext: true))]);
+			if (!hash_equals($previousConfig['embedding_model'], $models[$prefix . 'embedding_model'])) {
 				$this->store()->invalidateEmbeddings();
 			}
 			$this->store()->startBackfill();
 			Minz_Request::good(_t('feedback.conf.updated'), $this->settingsRedirect());
+		} elseif ($action === 'switch_profile') {
+			$previousConfig = $this->configuration();
+			$profile = Minz_Request::paramString('model_profile', plaintext: true);
+			if (!in_array($profile, ['local', 'cloud'], true)) {
+				Minz_Request::bad('Invalid model profile.');
+			}
+			$previousConfig['model_profile'] = $profile;
+			$previousConfig['summary_model'] = $previousConfig[$profile . '_summary_model'];
+			$previousConfig['judge_model'] = $previousConfig[$profile . '_judge_model'];
+			$previousConfig['embedding_model'] = $previousConfig[$profile . '_embedding_model'];
+			/** @phpstan-ignore method.deprecated */
+			$this->setUserConfiguration($previousConfig);
+			if (!hash_equals($this->configuration()['embedding_model'], $this->configuration()[$profile . '_embedding_model'])) {
+				$this->store()->invalidateEmbeddings();
+			}
+			$this->store()->requestWorkerRestart();
+			$this->store()->startBackfill();
+			$this->workerLaunchAttempted = false;
+			$this->launchAutomaticWorker();
+			Minz_Request::good(_t('ext.topic_digest.profile_switched',
+				_t('ext.topic_digest.profile_' . $profile)), $this->settingsRedirect());
 		} elseif ($action === 'save_display_settings') {
 			$config = $this->configuration();
 			$config['always_show_topics'] = Minz_Request::paramBoolean('always_show_topics');
@@ -923,6 +1064,7 @@ final class TopicDigestExtension extends Minz_Extension {
 			Minz_Request::good(_t('feedback.conf.updated'), $this->settingsRedirect());
 		} elseif ($action === 'save_topic') {
 			$id = Minz_Request::paramInt('topic_id');
+			$topicLock = $id > 0 ? $this->acquireTopicLock($id) : null;
 			$values = [
 				'name' => Minz_Request::paramString('name', plaintext: true),
 				'description' => Minz_Request::paramString('description', plaintext: true),
@@ -935,16 +1077,31 @@ final class TopicDigestExtension extends Minz_Extension {
 				'topic_type' => Minz_Request::paramString('topic_type', plaintext: true),
 				'show_verification' => Minz_Request::paramBoolean('show_verification'),
 			];
-			$topicId = $this->store()->saveTopic($values, $id > 0 ? $id : null);
-			$this->store()->startBackfill();
-			$this->syntheticFeedIds = null;
-			$this->synchroniseTopic($topicId, false);
+			try {
+				$topicId = $this->store()->saveTopic($values, $id > 0 ? $id : null);
+				$topicLock ??= $this->acquireTopicLock($topicId);
+				$this->store()->startBackfill();
+				$this->syntheticFeedIds = null;
+				$this->synchroniseTopic($topicId, false);
+			} finally {
+				if (is_resource($topicLock)) {
+					flock($topicLock, LOCK_UN);
+					fclose($topicLock);
+				}
+			}
 			Minz_Request::good(_t('feedback.conf.updated'), $this->settingsRedirect());
 		} elseif ($action === 'toggle') {
+			$topicId = Minz_Request::paramInt('topic_id');
+			$topicLock = $this->acquireTopicLock($topicId);
 			$enabled = Minz_Request::paramBoolean('enabled');
-			$this->store()->setTopicEnabled(Minz_Request::paramInt('topic_id'), $enabled);
-			if ($enabled) {
-				$this->store()->startBackfill();
+			try {
+				$this->store()->setTopicEnabled($topicId, $enabled);
+				if ($enabled) {
+					$this->store()->startBackfill();
+				}
+			} finally {
+				flock($topicLock, LOCK_UN);
+				fclose($topicLock);
 			}
 		} elseif ($action === 'rescan') {
 			$this->store()->startBackfill();
@@ -953,12 +1110,23 @@ final class TopicDigestExtension extends Minz_Extension {
 		} elseif ($action === 'restart') {
 			$this->store()->setPaused(true);
 			try {
+				$this->store()->requestWorkerRestart();
+				foreach ($this->store()->topics() as $topic) {
+					$topicLock = $this->acquireTopicLock((int)$topic['id']);
+					flock($topicLock, LOCK_UN);
+					fclose($topicLock);
+				}
 				$this->store()->rebuildDigests();
 				$this->store()->prepareRebuildJobs($this->pipelineHash());
 				foreach ($this->store()->topics() as $topic) {
-					$this->synchroniseTopic((int)$topic['id'], false, true);
+					$topicLock = $this->acquireTopicLock((int)$topic['id']);
+					try {
+						$this->synchroniseTopic((int)$topic['id'], false, true);
+					} finally {
+						flock($topicLock, LOCK_UN);
+						fclose($topicLock);
+					}
 				}
-				$this->store()->requestWorkerRestart();
 			} finally {
 				$this->store()->setPaused(false);
 			}
@@ -983,29 +1151,41 @@ final class TopicDigestExtension extends Minz_Extension {
 				: 'Recent matches: ' . implode('; ', $names));
 		} elseif ($action === 'suggestion') {
 			$topicId = Minz_Request::paramInt('topic_id');
-			$this->store()->resolveSuggestion($topicId, Minz_Request::paramInt('suggestion_id'),
-				Minz_Request::paramString('decision') === 'approve');
-			$this->synchroniseTopic($topicId, false);
+			$topicLock = $this->acquireTopicLock($topicId);
+			try {
+				$this->store()->resolveSuggestion($topicId, Minz_Request::paramInt('suggestion_id'),
+					Minz_Request::paramString('decision') === 'approve');
+				$this->synchroniseTopic($topicId, false);
+			} finally {
+				flock($topicLock, LOCK_UN);
+				fclose($topicLock);
+			}
 		} elseif ($action === 'delete' || $action === 'restore_delete') {
 			$topicId = Minz_Request::paramInt('topic_id');
-			$topic = $this->store()->topic($topicId);
-			if ($topic === null) {
-				throw new InvalidArgumentException('Unknown topic.');
-			}
-			if ($action === 'restore_delete') {
-				$ids = [];
-				foreach ($this->store()->events($topicId) as $event) {
-					$ids = [...$ids, ...$this->store()->restoreEvent($topicId, (int)$event['id'])];
+			$topicLock = $this->acquireTopicLock($topicId);
+			try {
+				$topic = $this->store()->topic($topicId);
+				if ($topic === null) {
+					throw new InvalidArgumentException('Unknown topic.');
 				}
-				$this->markUnread(array_values(array_unique($ids)));
+				if ($action === 'restore_delete') {
+					$ids = [];
+					foreach ($this->store()->events($topicId) as $event) {
+						$ids = [...$ids, ...$this->store()->restoreEvent($topicId, (int)$event['id'])];
+					}
+					$this->markUnread(array_values(array_unique($ids)));
+				}
+				if ((int)($topic['feed_id'] ?? 0) > 0
+						&& FreshRSS_Factory::createFeedDao()->searchById((int)$topic['feed_id']) !== null
+						&& !FreshRSS_feed_Controller::deleteFeed((int)$topic['feed_id'])) {
+					throw new RuntimeException('Could not delete the synthetic Topic Digest feed.');
+				}
+				$this->store()->deleteTopic($topicId);
+				$this->syntheticFeedIds = null;
+			} finally {
+				flock($topicLock, LOCK_UN);
+				fclose($topicLock);
 			}
-			if ((int)($topic['feed_id'] ?? 0) > 0
-					&& FreshRSS_Factory::createFeedDao()->searchById((int)$topic['feed_id']) !== null
-					&& !FreshRSS_feed_Controller::deleteFeed((int)$topic['feed_id'])) {
-				throw new RuntimeException('Could not delete the synthetic Topic Digest feed.');
-			}
-			$this->store()->deleteTopic($topicId);
-			$this->syntheticFeedIds = null;
 		} elseif ($action === 'test') {
 			$config = $this->configuration();
 			(new TopicDigestOllama($config['ollama_url'], $config['timeout']))->test([
@@ -1039,6 +1219,10 @@ final class TopicDigestExtension extends Minz_Extension {
 
 	private function validModelName(string $model): bool {
 		return preg_match('/^[A-Za-z0-9][A-Za-z0-9._\/:@-]{0,199}$/D', trim($model)) === 1;
+	}
+
+	private function validCloudConcurrency(string $value): string {
+		return in_array($value, ['auto', '1', '2', '4', '8', '16'], true) ? $value : 'auto';
 	}
 
 	public function launchAutomaticWorker(): void {

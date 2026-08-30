@@ -3,6 +3,7 @@ declare(strict_types=1);
 
 final class TopicDigestStore {
 	private const MAX_ATTEMPTS = 4;
+	private const LIVE_PRIORITY_BASE = 1_000_000_000;
 	private PDO $pdo;
 
 	public function __construct(string $path) {
@@ -159,6 +160,15 @@ final class TopicDigestStore {
 				updated_at INTEGER NOT NULL,
 				PRIMARY KEY(entry_id,content_hash,topic_id,candidate_id,candidate_hash,judge_model)
 			);
+			CREATE TABLE IF NOT EXISTS processing_samples (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				kind TEXT NOT NULL,
+				pipeline_hash TEXT NOT NULL,
+				articles INTEGER NOT NULL,
+				active_seconds REAL NOT NULL,
+				created_at INTEGER NOT NULL
+			);
+			CREATE INDEX IF NOT EXISTS processing_samples_created_idx ON processing_samples(created_at);
 			SQL);
 		if (!$this->hasColumn('summaries', 'analysis_hash')) {
 			$this->pdo->exec("ALTER TABLE summaries ADD COLUMN analysis_hash TEXT NOT NULL DEFAULT ''");
@@ -195,7 +205,7 @@ final class TopicDigestStore {
 			$this->setMeta('processing_metrics_revision', '2');
 			$this->setMeta('processing_metrics_sample_revision', '0');
 		}
-		$this->pdo->exec('PRAGMA user_version = 6');
+		$this->pdo->exec('PRAGMA user_version = 7');
 	}
 
 	/** @param array<string,mixed> $values */
@@ -348,6 +358,9 @@ final class TopicDigestStore {
 				. "pipeline_hash='',processing_seconds=0,processing_content_hash='',processing_pipeline_hash='',updated_at=?",
 				[$now]);
 			$this->setMeta('pipeline_revision', (string)($this->pipelineRevision() + 1));
+			$this->setMeta('parallel_metrics_pipeline_hash', '');
+			$this->setMeta('parallel_active_seconds', '0');
+			$this->setMeta('parallel_processed_articles', '0');
 			$this->setMeta('backfill_cursor', '99999999999999999999');
 			$this->setMeta('backfill_active', '1');
 			$this->pdo->commit();
@@ -372,6 +385,10 @@ final class TopicDigestStore {
 
 	public function completeRebuildRestore(string $entryId): void {
 		$this->execute('DELETE FROM rebuild_restores WHERE entry_id=?', [$entryId]);
+	}
+
+	public static function livePriority(?int $arrivalOrder = null): int {
+		return self::LIVE_PRIORITY_BASE + ($arrivalOrder ?? (int)floor(microtime(true) * 1000));
 	}
 
 	public function enqueue(FreshRSS_Entry $entry, int $categoryId, string $pipelineHash, int $priority = 100,
@@ -443,6 +460,15 @@ final class TopicDigestStore {
 			&& hash_equals((string)$row['pipeline_hash'], (string)$job['pipeline_hash']);
 	}
 
+	/** @param array<string,mixed> $job */
+	public function renewLease(array $job, int $leaseSeconds): bool {
+		$statement = $this->pdo->prepare("UPDATE jobs SET lease_until=?,updated_at=? WHERE entry_id=? AND state='processing' "
+			. 'AND content_hash=? AND pipeline_hash=?');
+		$now = time();
+		$statement->execute([$now + max(60, $leaseSeconds), $now, $job['entry_id'], $job['content_hash'], $job['pipeline_hash']]);
+		return $statement->rowCount() === 1;
+	}
+
 	public function classificationPending(string $entryId, string $contentHash): bool {
 		$row = $this->row('SELECT content_hash,state FROM jobs WHERE entry_id=?', [$entryId]);
 		return $row !== null && hash_equals((string)$row['content_hash'], $contentHash)
@@ -452,17 +478,27 @@ final class TopicDigestStore {
 	/** @param array<string,mixed> $job @param list<float> $embedding */
 	public function saveSummaryIfCurrent(array $job, string $analysisHash, string $feedName, string $summary,
 		string $sourceText, array $embedding): bool {
-		if (!$this->isCurrentJob($job)) {
-			return false;
+		$this->pdo->exec('BEGIN IMMEDIATE');
+		try {
+			if (!$this->isCurrentJob($job)) {
+				$this->pdo->commit();
+				return false;
+			}
+			$this->execute('INSERT INTO summaries(entry_id,content_hash,analysis_hash,feed_name,summary,source_text,embedding,updated_at) '
+				. 'VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(entry_id) DO UPDATE SET content_hash=excluded.content_hash,'
+				. 'analysis_hash=excluded.analysis_hash,feed_name=excluded.feed_name,summary=excluded.summary,source_text=excluded.source_text,'
+				. 'embedding=excluded.embedding,updated_at=excluded.updated_at', [
+					$job['entry_id'], $job['content_hash'], $analysisHash, $feedName, mb_substr($summary, 0, 10000),
+					mb_substr($sourceText, 0, 50000), json_encode($embedding, JSON_THROW_ON_ERROR), time(),
+				]);
+			$this->pdo->commit();
+			return true;
+		} catch (Throwable $e) {
+			if ($this->pdo->inTransaction()) {
+				$this->pdo->rollBack();
+			}
+			throw $e;
 		}
-		$this->execute('INSERT INTO summaries(entry_id,content_hash,analysis_hash,feed_name,summary,source_text,embedding,updated_at) '
-			. 'VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(entry_id) DO UPDATE SET content_hash=excluded.content_hash,'
-			. 'analysis_hash=excluded.analysis_hash,feed_name=excluded.feed_name,summary=excluded.summary,source_text=excluded.source_text,'
-			. 'embedding=excluded.embedding,updated_at=excluded.updated_at', [
-				$job['entry_id'], $job['content_hash'], $analysisHash, $feedName, mb_substr($summary, 0, 10000),
-				mb_substr($sourceText, 0, 50000), json_encode($embedding, JSON_THROW_ON_ERROR), time(),
-			]);
-		return true;
 	}
 
 	/** @return array<string,mixed>|null */
@@ -549,6 +585,34 @@ final class TopicDigestStore {
 			throw $e;
 		}
 		return array_values(array_unique(array_map(static fn(array $row): int => (int)$row['topic_id'], $rows)));
+	}
+
+	/** @return list<int> */
+	public function changedSourceTopicIds(string $entryId, string $contentHash): array {
+		$statement = $this->pdo->prepare('SELECT DISTINCT topic_id FROM sources WHERE entry_id=? AND content_hash<>? ORDER BY topic_id');
+		$statement->execute([$entryId, $contentHash]);
+		return array_map('intval', $statement->fetchAll(PDO::FETCH_COLUMN));
+	}
+
+	public function detachChangedSourceForTopic(int $topicId, string $entryId, string $contentHash): bool {
+		$source = $this->row('SELECT event_id FROM sources WHERE topic_id=? AND entry_id=? AND content_hash<>?',
+			[$topicId, $entryId, $contentHash]);
+		if ($source === null) {
+			return false;
+		}
+		$this->pdo->exec('BEGIN IMMEDIATE');
+		try {
+			$this->execute('DELETE FROM sources WHERE topic_id=? AND entry_id=? AND content_hash<>?',
+				[$topicId, $entryId, $contentHash]);
+			$this->removeEmptyEvent((int)$source['event_id']);
+			$this->pdo->commit();
+			return true;
+		} catch (Throwable $e) {
+			if ($this->pdo->inTransaction()) {
+				$this->pdo->rollBack();
+			}
+			throw $e;
+		}
 	}
 
 	public function isRejected(int $topicId, string $entryId, string $fingerprint = ''): bool {
@@ -744,25 +808,84 @@ final class TopicDigestStore {
 
 	/** @param array<string,mixed> $job */
 	public function completeCurrent(array $job, string $state = 'done', string $error = ''): bool {
-		if (!$this->isCurrentJob($job)) {
-			return false;
-		}
-		$this->execute('UPDATE jobs SET state=?,lease_until=0,error=?,updated_at=? WHERE entry_id=?',
-			[$state, mb_substr($error, 0, 1000), time(), $job['entry_id']]);
-		return true;
+		$statement = $this->pdo->prepare("UPDATE jobs SET state=?,lease_until=0,error=?,updated_at=? WHERE entry_id=? "
+			. "AND state='processing' AND content_hash=? AND pipeline_hash=?");
+		$statement->execute([$state, mb_substr($error, 0, 4000), time(), $job['entry_id'],
+			$job['content_hash'], $job['pipeline_hash']]);
+		return $statement->rowCount() === 1;
 	}
 
 	/** @param array<string,mixed> $job */
 	public function failCurrent(array $job, string $error): bool {
-		if (!$this->isCurrentJob($job)) {
-			return false;
+		$this->pdo->exec('BEGIN IMMEDIATE');
+		try {
+			$current = $this->row("SELECT attempts FROM jobs WHERE entry_id=? AND state='processing' "
+				. 'AND content_hash=? AND pipeline_hash=?', [$job['entry_id'], $job['content_hash'], $job['pipeline_hash']]);
+			if ($current === null) {
+				$this->pdo->commit();
+				return false;
+			}
+			$attempts = (int)$current['attempts'] + 1;
+			$this->execute("UPDATE jobs SET state=?,attempts=?,available_at=?,lease_until=0,error=?,updated_at=? WHERE entry_id=?",
+				[$attempts >= self::MAX_ATTEMPTS ? 'failed' : 'pending', $attempts,
+					$attempts >= self::MAX_ATTEMPTS ? 0 : time() + min(900, 30 * (2 ** $attempts)),
+					mb_substr($error, 0, 4000), time(), $job['entry_id']]);
+			$this->pdo->commit();
+			return true;
+		} catch (Throwable $e) {
+			if ($this->pdo->inTransaction()) {
+				$this->pdo->rollBack();
+			}
+			throw $e;
 		}
-		$attempts = (int)$job['attempts'] + 1;
-		$this->execute("UPDATE jobs SET state=?,attempts=?,available_at=?,lease_until=0,error=?,updated_at=? WHERE entry_id=?",
-			[$attempts >= self::MAX_ATTEMPTS ? 'failed' : 'pending', $attempts,
-				$attempts >= self::MAX_ATTEMPTS ? 0 : time() + min(900, 30 * (2 ** $attempts)),
-				mb_substr($error, 0, 1000), time(), $job['entry_id']]);
-		return true;
+	}
+
+	/** @param array<string,mixed> $job */
+	public function releaseCurrent(array $job, int $delaySeconds, string $reason): bool {
+		$statement = $this->pdo->prepare("UPDATE jobs SET state='pending',available_at=?,lease_until=0,error=?,updated_at=? "
+			. "WHERE entry_id=? AND state='processing' AND content_hash=? AND pipeline_hash=?");
+		$statement->execute([time() + max(1, min(21600, $delaySeconds)), mb_substr($reason, 0, 4000), time(),
+			$job['entry_id'], $job['content_hash'], $job['pipeline_hash']]);
+		return $statement->rowCount() === 1;
+	}
+
+	/** @param array<string,mixed> $job */
+	public function deferCurrent(array $job, int $delaySeconds = 1): bool {
+		$statement = $this->pdo->prepare("UPDATE jobs SET state='pending',available_at=?,lease_until=0,error='',updated_at=? "
+			. "WHERE entry_id=? AND state='processing' AND content_hash=? AND pipeline_hash=?");
+		$now = time();
+		$statement->execute([$now + max(1, min(60, $delaySeconds)), $now,
+			$job['entry_id'], $job['content_hash'], $job['pipeline_hash']]);
+		return $statement->rowCount() === 1;
+	}
+
+	/** @return array{target:int,successes:int,cooldown_until:int,backoff_level:int,last_status:int} */
+	public function cloudConcurrencyState(): array {
+		return [
+			'target' => max(1, min(16, (int)($this->getMeta('cloud_target_concurrency') ?? 2))),
+			'successes' => max(0, (int)($this->getMeta('cloud_successes') ?? 0)),
+			'cooldown_until' => max(0, (int)($this->getMeta('cloud_cooldown_until') ?? 0)),
+			'backoff_level' => max(0, min(10, (int)($this->getMeta('cloud_backoff_level') ?? 0))),
+			'last_status' => max(0, (int)($this->getMeta('cloud_last_status') ?? 0)),
+		];
+	}
+
+	/** @param array{target:int,successes:int,cooldown_until:int,backoff_level:int,last_status:int} $state */
+	public function saveCloudConcurrencyState(array $state): void {
+		$this->pdo->exec('BEGIN IMMEDIATE');
+		try {
+			$this->setMeta('cloud_target_concurrency', (string)max(1, min(16, $state['target'])));
+			$this->setMeta('cloud_successes', (string)max(0, $state['successes']));
+			$this->setMeta('cloud_cooldown_until', (string)max(0, $state['cooldown_until']));
+			$this->setMeta('cloud_backoff_level', (string)max(0, min(10, $state['backoff_level'])));
+			$this->setMeta('cloud_last_status', (string)max(0, $state['last_status']));
+			$this->pdo->commit();
+		} catch (Throwable $e) {
+			if ($this->pdo->inTransaction()) {
+				$this->pdo->rollBack();
+			}
+			throw $e;
+		}
 	}
 
 	public function retryFailed(): int {
@@ -779,6 +902,9 @@ final class TopicDigestStore {
 
 	public function startBackfill(): void {
 		$this->setMeta('pipeline_revision', (string)($this->pipelineRevision() + 1));
+		$this->setMeta('parallel_metrics_pipeline_hash', '');
+		$this->setMeta('parallel_active_seconds', '0');
+		$this->setMeta('parallel_processed_articles', '0');
 		$this->setMeta('backfill_cursor', '99999999999999999999');
 		$this->setMeta('backfill_active', '1');
 	}
@@ -847,10 +973,54 @@ final class TopicDigestStore {
 	}
 
 	public function recordProcessingActivity(string $entryId, float $seconds): bool {
-		$statement = $this->pdo->prepare("UPDATE jobs SET processing_seconds=?,processing_content_hash=content_hash,"
-			. "processing_pipeline_hash=pipeline_hash WHERE entry_id=? AND state IN ('done','skipped')");
-		$statement->execute([max(0.000000001, $seconds), $entryId]);
-		return $statement->rowCount() === 1;
+		$seconds = max(0.000000001, $seconds);
+		$now = time();
+		$this->pdo->exec('BEGIN IMMEDIATE');
+		try {
+			$statement = $this->pdo->prepare("UPDATE jobs SET processing_seconds=?,processing_content_hash=content_hash,"
+				. "processing_pipeline_hash=pipeline_hash WHERE entry_id=? AND state IN ('done','skipped')");
+			$statement->execute([$seconds, $entryId]);
+			$recorded = $statement->rowCount() === 1;
+			if ($recorded) {
+				$this->execute("INSERT INTO processing_samples(kind,pipeline_hash,articles,active_seconds,created_at) "
+					. "SELECT 'serial',pipeline_hash,1,?,? FROM jobs WHERE entry_id=?", [$seconds, $now, $entryId]);
+				$this->execute('DELETE FROM processing_samples WHERE created_at<?', [$now - 7200]);
+			}
+			$this->pdo->commit();
+			return $recorded;
+		} catch (Throwable $e) {
+			if ($this->pdo->inTransaction()) {
+				$this->pdo->rollBack();
+			}
+			throw $e;
+		}
+	}
+
+	public function recordParallelActivity(string $pipelineHash, int $articles, float $seconds): void {
+		if ($articles < 1 || $seconds <= 0.0) {
+			return;
+		}
+		$this->pdo->exec('BEGIN IMMEDIATE');
+		try {
+			if (!hash_equals($this->getMeta('parallel_metrics_pipeline_hash') ?? '', $pipelineHash)) {
+				$this->setMeta('parallel_metrics_pipeline_hash', $pipelineHash);
+				$this->setMeta('parallel_active_seconds', '0');
+				$this->setMeta('parallel_processed_articles', '0');
+			}
+			$this->setMeta('parallel_active_seconds', (string)((float)($this->getMeta('parallel_active_seconds') ?? 0) + $seconds));
+			$this->setMeta('parallel_processed_articles',
+				(string)((int)($this->getMeta('parallel_processed_articles') ?? 0) + $articles));
+			$now = time();
+			$this->execute('INSERT INTO processing_samples(kind,pipeline_hash,articles,active_seconds,created_at) '
+				. "VALUES('parallel',?,?,?,?)", [$pipelineHash, $articles, $seconds, $now]);
+			$this->execute('DELETE FROM processing_samples WHERE created_at<?', [$now - 7200]);
+			$this->pdo->commit();
+		} catch (Throwable $e) {
+			if ($this->pdo->inTransaction()) {
+				$this->pdo->rollBack();
+			}
+			throw $e;
+		}
 	}
 
 	/** @return array<string,int|float|string> */
@@ -862,6 +1032,9 @@ final class TopicDigestStore {
 		}
 		$result = $counts;
 		$result['queued'] = $counts['pending'] + $counts['processing'];
+		$ready = $this->pdo->prepare("SELECT COUNT(*) FROM jobs WHERE state='pending' AND available_at<=?");
+		$ready->execute([time()]);
+		$result['ready'] = (int)$ready->fetchColumn();
 		$result['processed'] = $counts['done'] + $counts['skipped'];
 		$result['topics'] = (int)$this->pdo->query('SELECT COUNT(*) FROM topics')->fetchColumn();
 		$result['events'] = (int)$this->pdo->query('SELECT COUNT(*) FROM events')->fetchColumn();
@@ -871,10 +1044,34 @@ final class TopicDigestStore {
 			. 'AND processing_content_hash=content_hash AND processing_pipeline_hash=pipeline_hash');
 		$result['active_processing_seconds'] = (float)($metric['seconds'] ?? 0.0);
 		$result['active_processed_articles'] = (int)($metric['articles'] ?? 0);
+		$parallelArticles = (int)($this->getMeta('parallel_processed_articles') ?? 0);
+		$parallelSeconds = (float)($this->getMeta('parallel_active_seconds') ?? 0);
+		if ($parallelArticles > 0 && $parallelSeconds > 0.0) {
+			$result['active_processing_seconds'] = $parallelSeconds;
+			$result['active_processed_articles'] = $parallelArticles;
+		}
 		$result['average_ready'] = $result['active_processing_seconds'] > 0.0
 			&& $result['active_processed_articles'] > 0 ? 1 : 0;
 		$result['average_per_hour'] = $result['average_ready'] !== 0
 			? round(($result['active_processed_articles'] * 3600) / $result['active_processing_seconds'], 1) : 0.0;
+		$recentSql = 'SELECT COALESCE(SUM(articles),0) AS articles,COALESCE(SUM(active_seconds),0) AS seconds '
+			. 'FROM processing_samples WHERE created_at>=?';
+		$recentValues = [time() - 3600];
+		if ($parallelArticles > 0 && $parallelSeconds > 0.0) {
+			$recentSql .= " AND kind='parallel' AND pipeline_hash=?";
+			$recentValues[] = $this->getMeta('parallel_metrics_pipeline_hash') ?? '';
+		} else {
+			$recentSql .= " AND kind='serial' AND EXISTS (SELECT 1 FROM jobs j "
+				. 'WHERE j.pipeline_hash=processing_samples.pipeline_hash '
+				. 'AND j.processing_pipeline_hash=j.pipeline_hash)';
+		}
+		$recentMetric = $this->row($recentSql, $recentValues);
+		$result['last_hour_active_seconds'] = (float)($recentMetric['seconds'] ?? 0.0);
+		$result['last_hour_processed_articles'] = (int)($recentMetric['articles'] ?? 0);
+		$result['last_hour_average_ready'] = $result['last_hour_active_seconds'] > 0.0
+			&& $result['last_hour_processed_articles'] > 0 ? 1 : 0;
+		$result['last_hour_average_per_hour'] = $result['last_hour_average_ready'] !== 0
+			? round(($result['last_hour_processed_articles'] * 3600) / $result['last_hour_active_seconds'], 1) : 0.0;
 		$result['backfill_active'] = $this->backfill()['active'] ? 1 : 0;
 		$result['paused'] = $this->isPaused() ? 1 : 0;
 		return $result;
@@ -882,7 +1079,8 @@ final class TopicDigestStore {
 
 	/** @return list<array<string,mixed>> */
 	public function recentErrors(): array {
-		$statement = $this->pdo->query("SELECT entry_id,title,error,attempts,updated_at FROM jobs WHERE error<>'' ORDER BY updated_at DESC LIMIT 20");
+		$statement = $this->pdo->query('SELECT entry_id,feed_id,title,state,error,attempts,available_at,updated_at '
+			. "FROM jobs WHERE error<>'' ORDER BY updated_at DESC LIMIT 20");
 		return $statement === false ? [] : $statement->fetchAll();
 	}
 

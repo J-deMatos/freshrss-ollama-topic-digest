@@ -22,7 +22,7 @@ if ($lock === false || !flock($lock, LOCK_EX | LOCK_NB)) {
 	fail('Topic Digest worker is already running or cannot acquire its lock.');
 }
 try {
-	$result = (new TopicDigestProcessor($extension))->run($limit);
+	$result = (new TopicDigestCoordinator($extension, $username))->run($limit);
 	echo 'Topic Digest processed ', $result['processed'], ' jobs; ', $result['failed'],
 		' failed; scanned ', $result['backfill_scanned'], " archive entries.\n";
 } catch (Throwable $e) {

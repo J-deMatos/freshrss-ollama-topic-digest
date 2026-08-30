@@ -33,6 +33,16 @@
 			<div class="group-controls"><input type="number" id="timeout" name="timeout" min="10" max="7200"
 				value="<?= (int)$this->settings['timeout'] ?>" /></div>
 		</div>
+		<div class="form-group">
+			<label class="group-name" for="cloud_concurrency"><?= _t('ext.topic_digest.cloud_concurrency') ?></label>
+			<div class="group-controls"><select id="cloud_concurrency" name="cloud_concurrency">
+				<?php foreach (['auto', '1', '2', '4', '8', '16'] as $value): ?>
+					<option value="<?= $value ?>" <?= $this->settings['cloud_concurrency'] === $value ? 'selected="selected"' : '' ?>>
+						<?= $value === 'auto' ? _t('ext.topic_digest.cloud_concurrency_auto') : $value ?>
+					</option>
+				<?php endforeach; ?>
+			</select><p class="help"><?= _t('ext.topic_digest.cloud_concurrency_help') ?></p></div>
+		</div>
 		<div class="form-group"><div class="group-controls"><label><input type="checkbox" name="scraping" value="1"
 			<?= $this->settings['scraping'] ? 'checked="checked"' : '' ?> /> <?= _t('ext.topic_digest.scraping') ?></label></div></div>
 		<div class="form-group form-actions"><div class="group-controls">
@@ -210,5 +220,21 @@
 
 <?php if ($this->errors !== []): ?>
 	<h4><?= _t('ext.topic_digest.recent_errors') ?></h4>
-	<ul><?php foreach ($this->errors as $error): ?><li><?= $esc((string)$error['title']) ?> — <?= $esc((string)$error['error']) ?></li><?php endforeach; ?></ul>
+	<ul><?php foreach ($this->errors as $error): ?>
+		<li>
+			<time datetime="<?= $esc(date(DATE_ATOM, (int)$error['updated_at'])) ?>">
+				<?= $esc(date('Y-m-d H:i:s T', (int)$error['updated_at'])) ?>
+			</time>
+			— <strong><?= $esc((string)$error['title']) ?></strong><br />
+			<?= nl2br($esc((string)$error['error'])) ?><br />
+			<small>
+				<?= $esc(_t('ext.topic_digest.error_context', (string)$error['entry_id'], (int)$error['feed_id'],
+					(int)$error['attempts'], (string)$error['state'])) ?>
+				<?php if ((string)$error['state'] === 'pending' && (int)$error['available_at'] > time()): ?>
+					· <?= $esc(_t('ext.topic_digest.error_retry_at',
+						date('Y-m-d H:i:s T', (int)$error['available_at']))) ?>
+				<?php endif; ?>
+			</small>
+		</li>
+	<?php endforeach; ?></ul>
 <?php endif; ?>

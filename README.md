@@ -1,7 +1,7 @@
 # FreshRSS Topic Digest
 
-A per-user FreshRSS extension that organises matching news using a local Ollama
-service. Each topic can be a low-priority living digest, a high-priority feed
+A per-user FreshRSS extension that organises matching news using Ollama,
+including locally registered Ollama Cloud models. Each topic can be a low-priority living digest, a high-priority feed
 of normal FreshRSS articles, or a rule that automatically marks matches read.
 
 ## Project status
@@ -16,6 +16,7 @@ to review rather than authoritative news.
 - FreshRSS with PHP 8.1 or newer and SQLite PDO support
 - Ollama reachable from the FreshRSS container or host
 - PHP `exec()` for the automatic worker, or a cron job for the CLI worker
+- PHP `proc_open()` for cloud parallelism (sequential fallback otherwise)
 - Write access to FreshRSS's per-user extension data directory
 
 The default Ollama URL is `http://ollama:11434`, suitable when FreshRSS and
@@ -130,8 +131,22 @@ no longer match return to the normal unread stream.
 
 A single locked worker starts automatically, uses expiring leases and retry
 backoff, and reloads after live code or configuration changes. The navigation
-status panel reports the queue, throughput, estimated completion time, events,
-sources, and failures, with Pause/Resume and rebuild controls.
+status panel reports the queue, rolling last-hour and all-time active-processing
+throughput, estimated completion time, events, sources, and failures, with
+Pause/Resume and rebuild controls.
+
+New and updated feed entries enter the queue immediately with an arrival-time
+priority above all existing live and archive work. An in-flight model request is
+allowed to finish; the newest arrival takes the next available worker slot.
+
+When both the summary and decision model names end in `:cloud`, that locked
+worker coordinates a bounded pool of independently bootstrapped PHP workers.
+Auto concurrency starts at 2, grows conservatively after sustained success,
+and halves on HTTP 429 or 503 capacity responses. `Retry-After` and a shared
+cooldown prevent retry storms; capacity responses return jobs to pending
+without consuming their normal failure attempts. Local and mixed model
+configurations remain sequential. Parallel mode requires PHP `proc_open()`;
+when it is unavailable the worker safely falls back to sequential execution.
 
 When both extensions are enabled, Topic Digest queues first and News
 Deduplicator waits for its classification of the same article revision. Topic
@@ -148,7 +163,9 @@ php /var/www/FreshRSS/extensions/xExtension-TopicDigest/cli/process.php \
 
 Average throughput includes only monotonic active time for successfully
 completed jobs. Pauses, archive scanning, failures, idle time, daemon downtime,
-wall-clock changes, and system suspend are excluded.
+wall-clock changes, and system suspend are excluded. In cloud parallel mode it
+uses coordinator wall-clock active time rather than summing overlapping job
+durations.
 
 ## Development and tests
 
@@ -159,6 +176,8 @@ dependencies installed:
 FRESHRSS_PATH=/path/to/FreshRSS \
 	/path/to/FreshRSS/vendor/bin/phpunit -c phpunit.xml.dist
 ```
+
+Run the deterministic fake-cloud benchmark with `php tests/benchmark_parallel.php`.
 
 Lint PHP before a release:
 

@@ -8,6 +8,8 @@ require_once dirname(__DIR__) . '/TopicDigestStore.php';
 require_once dirname(__DIR__) . '/ArticleSummaryCache.php';
 require_once dirname(__DIR__) . '/TopicDigestOllama.php';
 require_once dirname(__DIR__) . '/TopicDigestProcessor.php';
+require_once dirname(__DIR__) . '/TopicDigestCloudConcurrency.php';
+require_once dirname(__DIR__) . '/TopicDigestCoordinator.php';
 
 final class TopicDigestTest extends TestCase {
 	private string $databasePath;
@@ -42,6 +44,22 @@ final class TopicDigestTest extends TestCase {
 		$topic['description'] = 'Only announcements of newly available foundation models.';
 		$this->store->saveTopic($topic, $id);
 		self::assertNull($this->store->topic($id)['description_embedding']);
+	}
+
+	public function testEstimatedRemainingArticlesIncludesUnscannedArchive(): void {
+		self::assertSame(24, TopicDigestProcessor::estimatedRemainingArticles([
+			'queued' => 4,
+			'backfill_active' => 1,
+			'backfill_remaining' => 20,
+		]));
+		self::assertSame(4, TopicDigestProcessor::estimatedRemainingArticles([
+			'queued' => 4,
+			'backfill_active' => 0,
+		]));
+		self::assertNull(TopicDigestProcessor::estimatedRemainingArticles([
+			'queued' => 4,
+			'backfill_active' => 1,
+		]));
 	}
 
 	public function testTopicCanUseHighPriorityFeedPresentation(): void {
@@ -82,6 +100,36 @@ final class TopicDigestTest extends TestCase {
 		self::assertTrue($this->store->enqueue($entry, 2, 'pipeline-one'));
 		self::assertFalse($this->store->enqueue($entry, 2, 'pipeline-one'));
 		self::assertTrue($this->store->enqueue($entry, 2, 'pipeline-two'));
+	}
+
+	public function testNewLiveArticleHasAbsolutePriorityOverExistingAndArchiveJobs(): void {
+		$older = new FreshRSS_Entry(4, 'older', 'Existing live article', '', 'Body',
+			'https://example.com/older', 1_900_000_000);
+		$older->_id('1700000000000001');
+		$archive = new FreshRSS_Entry(4, 'archive', 'Newer archive article', '', 'Body',
+			'https://example.com/archive', 2_000_000_000);
+		$archive->_id('1700000000000002');
+		$arriving = new FreshRSS_Entry(4, 'arriving', 'Just arrived', '', 'Body',
+			'https://example.com/arriving', 1_600_000_000);
+		$arriving->_id('1700000000000003');
+		$this->store->enqueue($older, 2, 'pipeline', 100, grace: 0);
+		$this->store->enqueue($archive, 2, 'pipeline', 10, grace: 0, archive: true);
+		$this->store->enqueue($arriving, 2, 'pipeline', TopicDigestStore::livePriority(100), grace: 0);
+
+		self::assertSame($arriving->id(), $this->store->claim(600)['entry_id'] ?? null);
+	}
+
+	public function testImmediateLiveJobCanBeDeferredWithoutConsumingAnAttempt(): void {
+		$entry = new FreshRSS_Entry(4, 'defer', 'Not committed yet', '', 'Body',
+			'https://example.com/defer', 1_700_000_000);
+		$entry->_id('1700000000000004');
+		$this->store->enqueue($entry, 2, 'pipeline', TopicDigestStore::livePriority(), grace: 0);
+		$job = $this->store->claim(600);
+		self::assertNotNull($job);
+		self::assertTrue($this->store->deferCurrent($job));
+		self::assertSame(0, $this->store->status()['processing']);
+		self::assertSame(1, $this->store->status()['pending']);
+		self::assertSame([], $this->store->recentErrors());
 	}
 
 	public function testPendingClassificationOnlyBlocksTheMatchingArticleRevision(): void {
@@ -214,9 +262,40 @@ final class TopicDigestTest extends TestCase {
 		self::assertNotNull($this->store->claim(600));
 	}
 
+	public function testPauseAllowsOwnedWorkToFinishWithoutClaimingMore(): void {
+		foreach ([0, 1] as $index) {
+			$entry = new FreshRSS_Entry(4, 'pause-' . $index, 'Article ' . $index, '', 'Body',
+				'https://example.com/pause-' . $index, 1_700_000_000 + $index);
+			$entry->_id((string)(1_805_000_000_000_000 + $index));
+			$this->store->enqueue($entry, 2, 'pipeline', grace: 0);
+		}
+		$owned = $this->store->claim(600);
+		self::assertNotNull($owned);
+		$this->store->setPaused(true);
+		self::assertNull($this->store->claim(600));
+		self::assertTrue($this->store->completeCurrent($owned));
+		self::assertSame(0, $this->store->status()['processing']);
+		self::assertSame(1, $this->store->status()['pending']);
+	}
+
+	public function testRebuildInvalidatesAnOwnedJobBeforeItCanCommit(): void {
+		$entry = new FreshRSS_Entry(4, 'stale', 'Stale article', '', 'Body',
+			'https://example.com/stale', 1_700_000_000);
+		$entry->_id('1806000000000000');
+		$this->store->enqueue($entry, 2, 'pipeline', grace: 0);
+		$owned = $this->store->claim(600);
+		self::assertNotNull($owned);
+		$this->store->rebuildDigests();
+		self::assertFalse($this->store->completeCurrent($owned));
+		self::assertSame(0, $this->store->status()['processing']);
+		self::assertSame(1, $this->store->status()['pending']);
+	}
+
 	public function testAverageSpeedUsesOnlyRecordedActiveProcessingTime(): void {
 		self::assertSame(0, $this->store->status()['average_ready']);
 		self::assertSame(0.0, $this->store->status()['average_per_hour']);
+		self::assertSame(0, $this->store->status()['last_hour_average_ready']);
+		self::assertSame(0.0, $this->store->status()['last_hour_average_per_hour']);
 		foreach ([60.0, 60.0, 60.0] as $index => $seconds) {
 			$entry = new FreshRSS_Entry(4, 'metric-' . $index, 'Article ' . $index, '', 'Article body',
 				'https://example.com/metric-' . $index, 1_700_000_000 + $index);
@@ -233,9 +312,32 @@ final class TopicDigestTest extends TestCase {
 		self::assertSame(3, $status['active_processed_articles']);
 		self::assertSame(1, $status['average_ready']);
 		self::assertSame(60.0, $status['average_per_hour']);
+		self::assertSame(3, $status['last_hour_processed_articles']);
+		self::assertSame(180.0, $status['last_hour_active_seconds']);
+		self::assertSame(1, $status['last_hour_average_ready']);
+		self::assertSame(60.0, $status['last_hour_average_per_hour']);
 
 		$this->store->setPaused(true);
 		self::assertSame(60.0, $this->store->status()['average_per_hour']);
+		self::assertSame(60.0, $this->store->status()['last_hour_average_per_hour']);
+		$this->store->rebuildDigests();
+		self::assertSame(0, $this->store->status()['last_hour_average_ready']);
+	}
+
+	public function testParallelSpeedUsesCoordinatorWallTimeInsteadOfSummedJobDurations(): void {
+		$this->store->recordParallelActivity('pipeline-a', 4, 10.0);
+		$status = $this->store->status();
+		self::assertSame(10.0, $status['active_processing_seconds']);
+		self::assertSame(4, $status['active_processed_articles']);
+		self::assertSame(1440.0, $status['average_per_hour']);
+		self::assertSame(1440.0, $status['last_hour_average_per_hour']);
+
+		$this->store->recordParallelActivity('pipeline-b', 2, 10.0);
+		$status = $this->store->status();
+		self::assertSame(2, $status['active_processed_articles']);
+		self::assertSame(720.0, $status['average_per_hour']);
+		self::assertSame(2, $status['last_hour_processed_articles']);
+		self::assertSame(720.0, $status['last_hour_average_per_hour']);
 	}
 
 	public function testSharedSummaryCacheRequiresMatchingContentAndModels(): void {
@@ -266,12 +368,197 @@ final class TopicDigestTest extends TestCase {
 		$this->store->enqueue($entry, 2, 'pipeline', grace: 0);
 		$job = $this->store->claim(600);
 		self::assertNotNull($job);
-		self::assertTrue($this->store->failCurrent($job, 'Connection failed.'));
-		self::assertCount(1, $this->store->recentErrors());
+		$detail = 'Connection failed: ' . str_repeat('diagnostic-', 150);
+		self::assertTrue($this->store->failCurrent($job, $detail));
+		$errors = $this->store->recentErrors();
+		self::assertCount(1, $errors);
+		self::assertSame($detail, $errors[0]['error']);
+		self::assertSame('1700000000000000', $errors[0]['entry_id']);
+		self::assertSame(4, (int)$errors[0]['feed_id']);
+		self::assertSame('pending', $errors[0]['state']);
+		self::assertGreaterThan(0, (int)$errors[0]['available_at']);
+		self::assertGreaterThan(0, (int)$errors[0]['updated_at']);
 
 		self::assertSame(1, $this->store->clearErrors());
 		self::assertSame([], $this->store->recentErrors());
 		self::assertSame(1, $this->store->status()['pending']);
+	}
+
+	public function testCloudCapacityReleaseDoesNotConsumeAnAttempt(): void {
+		$entry = new FreshRSS_Entry(4, 'cloud-release', 'Cloud article', '', 'Article body',
+			'https://example.com/cloud-release', 1_700_000_000);
+		$entry->_id('1900000000000000');
+		$this->store->enqueue($entry, 2, 'pipeline', grace: 0);
+		$job = $this->store->claim(600);
+		self::assertNotNull($job);
+		self::assertSame(0, (int)$job['attempts']);
+		self::assertTrue($this->store->releaseCurrent($job, 1, 'HTTP 429'));
+		self::assertSame(0, $this->store->status()['failed']);
+		self::assertSame(1, $this->store->status()['pending']);
+		self::assertSame(0, (int)$this->store->recentErrors()[0]['attempts']);
+	}
+
+	public function testLeaseRenewalAndAtomicClaimsPreserveSingleOwnership(): void {
+		$entry = new FreshRSS_Entry(4, 'lease', 'Lease article', '', 'Article body',
+			'https://example.com/lease', 1_700_000_000);
+		$entry->_id('1900000000000001');
+		$this->store->enqueue($entry, 2, 'pipeline', grace: 0);
+		$firstStore = new TopicDigestStore($this->databasePath);
+		$secondStore = new TopicDigestStore($this->databasePath);
+		$job = $firstStore->claim(60);
+		self::assertNotNull($job);
+		self::assertTrue($firstStore->renewLease($job, 600));
+		self::assertNull($secondStore->claim(60));
+		self::assertTrue($firstStore->isCurrentJob($job));
+	}
+
+	public function testAdaptiveCloudConcurrencyIncreasesConservativelyAndHalvesOn429(): void {
+		$controller = new TopicDigestCloudConcurrency([
+			'target' => 2, 'successes' => 0, 'cooldown_until' => 0, 'backoff_level' => 0, 'last_status' => 0,
+		], 16);
+		for ($index = 0; $index < 8; $index++) {
+			$controller->success();
+		}
+		self::assertSame(3, $controller->target(100));
+		self::assertSame(30, $controller->throttle(429, 30, 100, 0));
+		self::assertSame(0, $controller->target(129));
+		self::assertSame(1, $controller->target(130));
+	}
+
+	public function testOnlyCloudCloudModelPairsEnableTheParallelPath(): void {
+		self::assertTrue(TopicDigestCoordinator::isCloudPair('gpt-oss:20b-cloud', 'gpt-oss:20b-cloud'));
+		self::assertFalse(TopicDigestCoordinator::isCloudPair('qwen3.5:9b', 'qwen3.5:9b'));
+		self::assertFalse(TopicDigestCoordinator::isCloudPair('gpt-oss:20b-cloud', 'qwen3.5:9b'));
+		self::assertFalse(TopicDigestCoordinator::isCloudPair('qwen3.5:9b', 'gpt-oss:20b-cloud'));
+	}
+
+	public function testRepeated429AtConcurrencyOneCreatesLongGlobalCooldown(): void {
+		$controller = new TopicDigestCloudConcurrency([
+			'target' => 1, 'successes' => 0, 'cooldown_until' => 0, 'backoff_level' => 1, 'last_status' => 429,
+		], 16);
+		$delay = $controller->throttle(429, null, 100, 0);
+		self::assertGreaterThanOrEqual(900, $delay);
+		self::assertSame(0, $controller->target(100 + $delay - 1));
+		self::assertSame(1, $controller->target(100 + $delay));
+	}
+
+	public function testSibling429ResponsesFromAParallelWaveDoNotMimicSingleRequestExhaustion(): void {
+		$controller = new TopicDigestCloudConcurrency([
+			'target' => 2, 'successes' => 0, 'cooldown_until' => 0, 'backoff_level' => 0, 'last_status' => 0,
+		], 16);
+		$controller->throttle(429, null, 100, 0, 2);
+		$delay = $controller->throttle(429, null, 100, 0, 2);
+		self::assertLessThan(900, $delay);
+	}
+
+	public function testAdaptiveCloudStateIsSharedThroughTheStore(): void {
+		$state = ['target' => 4, 'successes' => 3, 'cooldown_until' => 1234, 'backoff_level' => 2, 'last_status' => 429];
+		$this->store->saveCloudConcurrencyState($state);
+		$otherConnection = new TopicDigestStore($this->databasePath);
+		self::assertSame($state, $otherConnection->cloudConcurrencyState());
+	}
+
+	public function test503ReducesConcurrencyWhile502OnlyBacksOff(): void {
+		$overload = new TopicDigestCloudConcurrency([
+			'target' => 8, 'successes' => 0, 'cooldown_until' => 0, 'backoff_level' => 0, 'last_status' => 0,
+		], 16);
+		$overload->throttle(503, 1, 100, 0);
+		self::assertSame(4, $overload->target(101));
+
+		$gateway = new TopicDigestCloudConcurrency([
+			'target' => 8, 'successes' => 0, 'cooldown_until' => 0, 'backoff_level' => 0, 'last_status' => 0,
+		], 16);
+		$gateway->throttle(502, 1, 100, 0);
+		self::assertSame(8, $gateway->target(101));
+	}
+
+	public function testConcurrentStoresNeverClaimTheSameArticleRevision(): void {
+		if (!function_exists('proc_open')) {
+			self::markTestSkipped('proc_open is required for the process-concurrency test.');
+		}
+		for ($index = 0; $index < 16; $index++) {
+			$entry = new FreshRSS_Entry(4, 'claim-' . $index, 'Article ' . $index, '', 'Body',
+				'https://example.com/claim-' . $index, 1_700_000_000 + $index);
+			$entry->_id((string)(1_910_000_000_000_000 + $index));
+			$this->store->enqueue($entry, 2, 'pipeline', grace: 0);
+		}
+		$commands = array_fill(0, 16, [PHP_BINARY, __DIR__ . '/concurrency_worker.php',
+			'claim', $this->databasePath, '100000']);
+		$outputs = $this->runConcurrentCommands($commands);
+		$claimed = array_values(array_filter(array_map('trim', $outputs)));
+		self::assertCount(16, $claimed);
+		self::assertCount(16, array_unique($claimed));
+		self::assertSame(16, $this->store->status()['processing']);
+		$this->store->rebuildDigests();
+		self::assertSame(0, $this->store->status()['processing']);
+	}
+
+	public function testFakeDelayedCloudRequestsAreActuallyConcurrent(): void {
+		if (!function_exists('proc_open')) {
+			self::markTestSkipped('proc_open is required for the process-concurrency test.');
+		}
+		$command = [PHP_BINARY, __DIR__ . '/concurrency_worker.php', 'delay', '150000'];
+		$serialStarted = hrtime(true);
+		for ($index = 0; $index < 4; $index++) {
+			$this->runConcurrentCommands([$command]);
+		}
+		$serialSeconds = (hrtime(true) - $serialStarted) / 1_000_000_000;
+		$parallelStarted = hrtime(true);
+		$this->runConcurrentCommands(array_fill(0, 4, $command));
+		$parallelSeconds = (hrtime(true) - $parallelStarted) / 1_000_000_000;
+		self::assertLessThan($serialSeconds * 0.65, $parallelSeconds);
+	}
+
+	public function testSameTopicFinalisationCreatesOneEventWithTwoSources(): void {
+		if (!function_exists('proc_open')) {
+			self::markTestSkipped('proc_open is required for the process-concurrency test.');
+		}
+		$topicId = $this->store->saveTopic(['name' => 'AI', 'description' => 'AI model releases',
+			'enabled' => true, 'all_feeds' => true]);
+		$lockPath = dirname($this->databasePath) . '/topic-digest-test-' . bin2hex(random_bytes(8)) . '.lock';
+		try {
+			$this->runConcurrentCommands([
+				[PHP_BINARY, __DIR__ . '/concurrency_worker.php', 'same-event', $this->databasePath,
+					$lockPath, (string)$topicId, 'source-a'],
+				[PHP_BINARY, __DIR__ . '/concurrency_worker.php', 'same-event', $this->databasePath,
+					$lockPath, (string)$topicId, 'source-b'],
+			]);
+			$events = $this->store->events($topicId);
+			self::assertCount(1, $events);
+			self::assertCount(2, $events[0]['sources']);
+		} finally {
+			if (is_file($lockPath)) {
+				unlink($lockPath);
+			}
+		}
+	}
+
+	public function testDifferentTopicLocksCanProgressConcurrently(): void {
+		if (!function_exists('proc_open')) {
+			self::markTestSkipped('proc_open is required for the process-concurrency test.');
+		}
+		$firstLock = sys_get_temp_dir() . '/topic-lock-' . bin2hex(random_bytes(8));
+		$secondLock = $firstLock . '-other';
+		try {
+			$sameStarted = hrtime(true);
+			$this->runConcurrentCommands(array_fill(0, 2,
+				[PHP_BINARY, __DIR__ . '/concurrency_worker.php', 'locked-delay', $firstLock, '400000']));
+			$sameSeconds = (hrtime(true) - $sameStarted) / 1_000_000_000;
+
+			$differentStarted = hrtime(true);
+			$this->runConcurrentCommands([
+				[PHP_BINARY, __DIR__ . '/concurrency_worker.php', 'locked-delay', $firstLock, '400000'],
+				[PHP_BINARY, __DIR__ . '/concurrency_worker.php', 'locked-delay', $secondLock, '400000'],
+			]);
+			$differentSeconds = (hrtime(true) - $differentStarted) / 1_000_000_000;
+			self::assertLessThan($sameSeconds * 0.8, $differentSeconds);
+		} finally {
+			foreach ([$firstLock, $secondLock] as $path) {
+				if (is_file($path)) {
+					unlink($path);
+				}
+			}
+		}
 	}
 
 	public function testChangedSourceIsDetachedBeforeReclassification(): void {
@@ -472,6 +759,26 @@ final class TopicDigestTest extends TestCase {
 		];
 		return ['type' => 'object', 'properties' => $properties, 'required' => array_keys($properties),
 			'additionalProperties' => false];
+	}
+
+	/** @param list<list<string>> $commands @return list<string> */
+	private function runConcurrentCommands(array $commands): array {
+		$workers = [];
+		foreach ($commands as $command) {
+			$pipes = [];
+			$process = proc_open($command, [0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+			self::assertIsResource($process);
+			$workers[] = ['process' => $process, 'pipes' => $pipes];
+		}
+		$outputs = [];
+		foreach ($workers as $worker) {
+			$outputs[] = stream_get_contents($worker['pipes'][1]) ?: '';
+			$error = stream_get_contents($worker['pipes'][2]) ?: '';
+			fclose($worker['pipes'][1]);
+			fclose($worker['pipes'][2]);
+			self::assertSame(0, proc_close($worker['process']), $error);
+		}
+		return $outputs;
 	}
 
 	/** @return array<string,mixed> */

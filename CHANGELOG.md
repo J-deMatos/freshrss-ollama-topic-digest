@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- Add adaptive process-level concurrency when both generative models use
+  Ollama Cloud, while preserving sequential local and mixed-model processing.
+- Honour cloud throttling and `Retry-After` without consuming article failure
+  attempts, renew leases during inference, and serialize finalisation per topic.
+- Measure parallel throughput using coordinator active wall time and add a
+  deterministic synthetic concurrency benchmark.
+- Estimate completion during archive scans from both queued jobs and entries
+  still below the persistent backfill cursor.
+- Include timestamps, job context, exception chains, and HTTP/cURL diagnostics
+  in Recent errors and the worker log.
+- Split processing throughput into rolling last-hour and all-time active-time
+  averages, using coordinator wall time for parallel cloud batches.
+- Give newly arrived and updated entries immediate, arrival-ordered priority
+  over existing live and archive jobs without interrupting in-flight requests.
+
 ## 0.4.0 - 2026-08-28
 
 - Add mark-read topics that automatically read matching originals without

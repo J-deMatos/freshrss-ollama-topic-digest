@@ -9,6 +9,10 @@ return [
 		'judge_model' => 'Decision model',
 		'embedding_model' => 'Embedding model',
 		'timeout' => 'Timeout (seconds)',
+		'cloud_concurrency' => 'Cloud concurrency',
+		'cloud_concurrency_auto' => 'Auto',
+		'cloud_concurrency_help' => 'Used only when both summary and decision models end in :cloud. Auto starts at 2, '
+			. 'increases conservatively after sustained success, and backs off on cloud throttling.',
 		'scraping' => 'Fetch article pages when RSS content is incomplete',
 		'display_settings' => 'Display settings',
 		'always_show_topics' => 'Always show Topic Digests and topic feeds',
@@ -81,6 +85,8 @@ return [
 		'backfill_active' => 'Archive scan active',
 		'stats_summary' => 'Digest: %d queued · %d processed',
 		'average_speed' => 'Average processing speed',
+		'last_hour_average_speed' => 'Last hour processing speed',
+		'all_time_average_speed' => 'All-time processing speed',
 		'articles_per_hour' => '%s articles/hour',
 		'estimated_time' => 'Estimated processing time',
 		'estimated_duration' => 'About %s remaining',
@@ -95,5 +101,7 @@ return [
 		'retry' => 'Retry failures',
 		'reset_log' => 'Reset logs',
 		'recent_errors' => 'Recent errors',
+		'error_context' => 'Entry %s · feed %d · attempt %d · state %s',
+		'error_retry_at' => 'next retry %s',
 	],
 ];

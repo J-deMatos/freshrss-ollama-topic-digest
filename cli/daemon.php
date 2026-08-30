@@ -33,6 +33,7 @@ $reload = false;
 $fingerprint = static function () use ($username): string {
 	$paths = array_merge(
 		glob(dirname(__DIR__) . '/*.php') ?: [],
+		glob(__DIR__ . '/*.php') ?: [],
 		[__FILE__, USERS_PATH . '/' . $username . '/config.php']
 	);
 	sort($paths);
@@ -47,11 +48,13 @@ $fingerprint = static function () use ($username): string {
 };
 $startingFingerprint = $fingerprint();
 $startingRestartRevision = $extension->store()->workerRestartRevision();
+$coordinator = new TopicDigestCoordinator($extension, $username);
+$parallelCloud = $coordinator->parallelCloudEnabled();
 try {
 	do {
 		$result = ['processed' => 0, 'failed' => 0, 'backfill_scanned' => 0];
 		for ($index = 0; $index < $batch; $index++) {
-			$single = (new TopicDigestProcessor($extension))->run(1);
+			$single = $coordinator->run($parallelCloud ? $batch : 1);
 			$result['processed'] += $single['processed'];
 			$result['failed'] += $single['failed'];
 			$result['backfill_scanned'] += $single['backfill_scanned'];
@@ -66,6 +69,9 @@ try {
 			if ($single['processed'] === 0 && $single['failed'] === 0) {
 				break;
 			}
+			if ($parallelCloud) {
+				break;
+			}
 		}
 		$status = $extension->store()->status();
 		echo date(DATE_ATOM), ': processed ', $result['processed'], '; failed ', $result['failed'],
@@ -75,7 +81,7 @@ try {
 			break;
 		}
 		if ($result['processed'] === 0 && $result['failed'] === 0) {
-			sleep(5);
+			sleep(1);
 		}
 		gc_collect_cycles();
 	} while ($maxRuntime === 0 || time() - $startedAt < $maxRuntime);

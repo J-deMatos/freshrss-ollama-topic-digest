@@ -9,28 +9,52 @@ final class TopicDigestProcessor {
 	/** @var TopicDigestConfig */
 	private array $config;
 	private TopicDigestOllama $ollama;
+	private int $workerRestartRevision;
 
 	public function __construct(private readonly TopicDigestExtension $extension) {
 		$this->store = $extension->store();
 		$this->config = $extension->configuration();
 		$this->ollama = new TopicDigestOllama((string)$this->config['ollama_url'], (int)$this->config['timeout']);
+		$this->workerRestartRevision = $this->store->workerRestartRevision();
 	}
 
-	/** @return array{processed:int,failed:int,backfill_scanned:int} */
+	/** @return array{processed:int,failed:int,backfill_scanned:int,throttle_status:int,retry_after:int} */
 	public function run(int $limit): array {
 		if ($this->store->isPaused()) {
-			return ['processed' => 0, 'failed' => 0, 'backfill_scanned' => 0];
+			return ['processed' => 0, 'failed' => 0, 'backfill_scanned' => 0, 'throttle_status' => 0, 'retry_after' => -1];
 		}
-		return $this->runActive($limit);
+		return $this->runActive($limit, true, true);
 	}
 
-	/** @return array{processed:int,failed:int,backfill_scanned:int} */
-	private function runActive(int $limit): array {
+	/**
+	 * @param array<string,int|float|string> $status
+	 */
+	public static function estimatedRemainingArticles(array $status): ?int {
+		$remaining = max(0, (int)($status['queued'] ?? 0));
+		if ((int)($status['backfill_active'] ?? 0) === 0) {
+			return $remaining;
+		}
+		$archiveRemaining = (int)($status['backfill_remaining'] ?? -1);
+		return $archiveRemaining < 0 ? null : $remaining + $archiveRemaining;
+	}
+
+	/** @return array{processed:int,failed:int,backfill_scanned:int,throttle_status:int,retry_after:int} */
+	public function runWorker(): array {
+		if ($this->store->isPaused()) {
+			return ['processed' => 0, 'failed' => 0, 'backfill_scanned' => 0, 'throttle_status' => 0, 'retry_after' => -1];
+		}
+		return $this->runActive(1, false, false);
+	}
+
+	/** @return array{processed:int,failed:int,backfill_scanned:int,throttle_status:int,retry_after:int} */
+	private function runActive(int $limit, bool $scanBackfill, bool $recordPerJobActivity): array {
 		$processed = 0;
 		$failed = 0;
 		$scanned = 0;
+		$throttleStatus = 0;
+		$retryAfter = -1;
 		$status = $this->store->status();
-		if (!$this->store->isPaused() && $this->store->backfill()['active']
+		if ($scanBackfill && !$this->store->isPaused() && $this->store->backfill()['active']
 				&& (int)$status['queued'] < max(20, $limit * 2)) {
 			$count = $this->extension->enqueueBackfillPage(20);
 			$scanned += $count;
@@ -39,7 +63,8 @@ final class TopicDigestProcessor {
 			}
 		}
 		if ($this->store->isPaused()) {
-			return ['processed' => 0, 'failed' => 0, 'backfill_scanned' => $scanned];
+			return ['processed' => 0, 'failed' => 0, 'backfill_scanned' => $scanned,
+				'throttle_status' => 0, 'retry_after' => -1];
 		}
 		for ($index = 0; $index < $limit; $index++) {
 			$job = $this->store->claim(max(600, (int)$this->config['timeout'] * 10));
@@ -51,6 +76,9 @@ final class TopicDigestProcessor {
 				if ($this->process($job)) {
 					$processed++;
 					try {
+						if (!$recordPerJobActivity) {
+							continue;
+						}
 						if (!$this->store->recordProcessingActivity((string)$job['entry_id'],
 								(hrtime(true) - $jobStartedAt) / 1_000_000_000)) {
 							Minz_Log::error('Topic Digest could not attach processing metrics to the completed job.');
@@ -59,14 +87,69 @@ final class TopicDigestProcessor {
 						Minz_Log::error('Topic Digest processing metrics error: ' . $e->getMessage());
 					}
 				}
-			} catch (Throwable $e) {
-				if ($this->store->failCurrent($job, $e->getMessage())) {
+			} catch (TopicDigestOllamaHttpException $e) {
+				$detail = self::exceptionDetails($e);
+				if ($e->cloudRequest && in_array($e->status, [429, 503], true)) {
+					$delay = $e->retryAfter ?? match ($e->status) { 429 => 30, 503 => 15, default => 5 };
+					if ($this->store->releaseCurrent($job, $delay, $detail)) {
+						$throttleStatus = $e->status;
+						$retryAfter = $e->retryAfter ?? -1;
+						$this->writeJobLog($job, $detail, true);
+					}
+					break;
+				}
+				if ($e->cloudRequest && $e->status === 502) {
+					if ($this->store->failCurrent($job, $detail)) {
+						$failed++;
+						$throttleStatus = 502;
+						$retryAfter = $e->retryAfter ?? -1;
+						$this->writeJobLog($job, $detail, true);
+					}
+					break;
+				}
+				if ($this->store->failCurrent($job, $detail)) {
 					$failed++;
-					Minz_Log::error('Topic Digest worker error: ' . $e->getMessage());
+					$this->writeJobLog($job, $detail);
+				}
+			} catch (Throwable $e) {
+				$detail = self::exceptionDetails($e);
+				if ($this->store->failCurrent($job, $detail)) {
+					$failed++;
+					$this->writeJobLog($job, $detail);
 				}
 			}
 		}
-		return ['processed' => $processed, 'failed' => $failed, 'backfill_scanned' => $scanned];
+		return ['processed' => $processed, 'failed' => $failed, 'backfill_scanned' => $scanned,
+			'throttle_status' => $throttleStatus, 'retry_after' => $retryAfter];
+	}
+
+	private static function exceptionDetails(Throwable $exception): string {
+		$details = [];
+		for ($current = $exception, $depth = 0; $current !== null && $depth < 4;
+				$current = $current->getPrevious(), $depth++) {
+			$message = trim($current->getMessage());
+			$details[] = get_class($current) . ($message === '' ? '' : ': ' . $message)
+				. ' at ' . basename($current->getFile()) . ':' . $current->getLine();
+		}
+		return implode(' Caused by ', $details);
+	}
+
+	/** @param array<string,mixed> $job */
+	private function writeJobLog(array $job, string $detail, bool $warning = false): void {
+		$line = date(DATE_ATOM)
+			. ' entry=' . (string)$job['entry_id']
+			. ' feed=' . (int)$job['feed_id']
+			. ' attempt=' . ((int)$job['attempts'] + 1)
+			. ' title=' . json_encode((string)$job['title'], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)
+			. ' error=' . $detail;
+		if ($warning) {
+			Minz_Log::warning('Topic Digest worker warning: ' . $line);
+		} else {
+			Minz_Log::error('Topic Digest worker error: ' . $line);
+		}
+		if (defined('TOPIC_DIGEST_WORKER')) {
+			fwrite(STDERR, $line . "\n");
+		}
 	}
 
 	/** @param array<string,mixed> $topic @return list<array{title:string,matches:bool,confidence:float,reason:string}> */
@@ -93,8 +176,16 @@ final class TopicDigestProcessor {
 
 	/** @param array<string,mixed> $job */
 	private function process(array $job): bool {
+		$this->renewLease($job);
 		$entry = FreshRSS_Factory::createEntryDao()->searchById((string)$job['entry_id']);
 		if ($entry === null) {
+			if (!$this->jobUsesCurrentPipeline($job)) {
+				return false;
+			}
+			if (!(bool)($job['is_archive'] ?? false) && time() - (int)$job['created_at'] < 60) {
+				$this->store->deferCurrent($job);
+				return false;
+			}
 			$this->store->completeRebuildRestore((string)$job['entry_id']);
 			return $this->store->completeCurrent($job, 'skipped', 'Entry no longer exists.');
 		}
@@ -108,17 +199,30 @@ final class TopicDigestProcessor {
 				archive: (bool)($job['is_archive'] ?? false));
 			return false;
 		}
-		foreach ($this->store->detachChangedSources($entry->id(), $entry->hash()) as $topicId) {
-			if ($this->store->topic($topicId) !== null) {
-				$this->extension->synchroniseTopic($topicId, false, true);
+		foreach ($this->store->changedSourceTopicIds($entry->id(), $entry->hash()) as $topicId) {
+			$topicLock = $this->acquireTopicLock($topicId, $job);
+			try {
+				if ($this->store->detachChangedSourceForTopic($topicId, $entry->id(), $entry->hash())
+						&& $this->store->topic($topicId) !== null) {
+					$this->extension->synchroniseTopic($topicId, false, true);
+				}
+			} finally {
+				flock($topicLock, LOCK_UN);
+				fclose($topicLock);
 			}
 		}
 		foreach ($this->store->topicIdsForSource($entry->id()) as $topicId) {
-			$membershipTopic = $this->store->topic($topicId);
-			if ($membershipTopic === null || ($membershipTopic['enabled'] && !$this->topicAccepts($membershipTopic, $job))) {
-				if ($this->store->removeSourceMembership($topicId, $entry->id()) && $membershipTopic !== null) {
-					$this->extension->synchroniseTopic($topicId, false, true);
+			$topicLock = $this->acquireTopicLock($topicId, $job);
+			try {
+				$membershipTopic = $this->store->topic($topicId);
+				if ($membershipTopic === null || ($membershipTopic['enabled'] && !$this->topicAccepts($membershipTopic, $job))) {
+					if ($this->store->removeSourceMembership($topicId, $entry->id()) && $membershipTopic !== null) {
+						$this->extension->synchroniseTopic($topicId, false, true);
+					}
 				}
+			} finally {
+				flock($topicLock, LOCK_UN);
+				fclose($topicLock);
 			}
 		}
 		if ($entry->isFavorite() || $this->store->isProtected($entry->id())) {
@@ -150,8 +254,10 @@ final class TopicDigestProcessor {
 				if ((bool)$this->config['scraping'] && TopicDigestScraper::isInsufficient((string)$job['rss_text'])) {
 					$text = TopicDigestScraper::fetch((string)$job['link'], min(60, (int)$this->config['timeout'])) ?? $text;
 				}
+				$this->renewLease($job);
 				$summary = $this->ollama->summarise((string)$this->config['summary_model'],
 					(string)$job['title'], $text, (int)$job['published_at']);
+				$this->renewLease($job);
 				$embedding = $this->ollama->embed((string)$this->config['embedding_model'], $this->summaryText($summary));
 			}
 			$feedName = htmlspecialchars_decode($entry->feed()?->name(raw: true) ?? '', ENT_QUOTES);
@@ -184,62 +290,61 @@ final class TopicDigestProcessor {
 				continue;
 			}
 			$decision = $topicDecisions[(int)$topic['id']];
-			if (!$this->jobUsesCurrentPipeline($job) || $this->store->topic((int)$topic['id']) === null) {
-				return false;
-			}
-			if (!$decision['matches'] || $decision['confidence'] < (float)$topic['confidence']) {
-				if ($this->store->removeSourceMembership((int)$topic['id'], $entry->id())) {
-					$this->extension->synchroniseTopic((int)$topic['id'], false, true);
-				}
-				continue;
-			}
-			$eventTitle = $decision['event_title'] !== '' ? $decision['event_title'] : (string)$summary['event_title'];
-			$occurredAt = strtotime((string)($summary['event_date'] ?? '')) ?: (int)$job['published_at'];
-			if ($occurredAt < 1 || $occurredAt > time() + 86400) {
-				$occurredAt = (int)$job['published_at'];
-			}
-			$fingerprint = hash('sha256', mb_strtolower(trim($eventTitle), 'UTF-8'));
-			if ($this->store->isRejected((int)$topic['id'], $entry->id(), $fingerprint)) {
-				continue;
-			}
-			$eventResolution = $this->eventResolution((int)$topic['id'], $job, $summary, $embedding);
-			if ($eventResolution === null) {
-				return false;
-			}
-			if ($eventResolution['rejected']) {
-				continue;
-			}
-			$eventId = $eventResolution['event_id'];
-			if (!$this->jobUsesCurrentPipeline($job)) {
-				return false;
-			}
+			$topicLock = $this->acquireTopicLock((int)$topic['id'], $job);
 			try {
-				$result = $this->store->addMatch((int)$topic['id'], $job, (string)$stored['feed_name'], $eventTitle,
-					$occurredAt, $decision['reason'], $embedding, $eventId);
-			} catch (DomainException) {
-				continue;
-			}
-			if ($result === null) {
-				return false;
-			}
-			if ($topic['topic_type'] === 'feed') {
-				$this->extension->materialiseTopicSource((int)$topic['id'], $entry->id(), $result['new_event']);
-			} elseif ($topic['topic_type'] === 'digest' || (bool)$topic['show_verification']) {
-				$this->extension->synchroniseTopic((int)$topic['id'], $result['new_event']);
-			}
-			$matched = true;
-		}
-		if ($matched) {
-			$entryDao = FreshRSS_Factory::createEntryDao();
-			$current = $entryDao->searchById($entry->id());
-			if ($current !== null && hash_equals($entry->hash(), $current->hash()) && !$current->isRead()
-					&& !$current->isFavorite() && !$this->store->isProtected($current->id())
-					&& ((method_exists($current, 'lastUserModified') && $current->lastUserModified() === null)
-						|| (!method_exists($current, 'lastUserModified') && $this->extension->supportsEntriesReadHook()))) {
-				$affected = $entryDao->markRead($current->id(), true);
-				if ($affected === false) {
-					throw new RuntimeException('Could not mark the matched source as read.');
+				$this->renewLease($job);
+				$currentTopic = $this->store->topic((int)$topic['id']);
+				if (!$this->jobUsesCurrentPipeline($job) || $currentTopic === null) {
+					return false;
 				}
+				if (!$decision['matches'] || $decision['confidence'] < (float)$currentTopic['confidence']) {
+					if ($this->store->removeSourceMembership((int)$topic['id'], $entry->id())) {
+						$this->extension->synchroniseTopic((int)$topic['id'], false, true);
+					}
+					continue;
+				}
+				$eventTitle = $decision['event_title'] !== '' ? $decision['event_title'] : (string)$summary['event_title'];
+				$occurredAt = strtotime((string)($summary['event_date'] ?? '')) ?: (int)$job['published_at'];
+				if ($occurredAt < 1 || $occurredAt > time() + 86400) {
+					$occurredAt = (int)$job['published_at'];
+				}
+				$fingerprint = hash('sha256', mb_strtolower(trim($eventTitle), 'UTF-8'));
+				if ($this->store->isRejected((int)$topic['id'], $entry->id(), $fingerprint)) {
+					continue;
+				}
+				$eventResolution = $this->eventResolution((int)$topic['id'], $job, $summary, $embedding);
+				if ($eventResolution === null) {
+					return false;
+				}
+				if ($eventResolution['rejected']) {
+					continue;
+				}
+				$eventId = $eventResolution['event_id'];
+				if (!$this->jobUsesCurrentPipeline($job)) {
+					return false;
+				}
+				try {
+					$result = $this->store->addMatch((int)$topic['id'], $job, (string)$stored['feed_name'], $eventTitle,
+						$occurredAt, $decision['reason'], $embedding, $eventId);
+				} catch (DomainException) {
+					continue;
+				}
+				if ($result === null) {
+					return false;
+				}
+				if (!$this->jobUsesCurrentPipeline($job)) {
+					return false;
+				}
+				if ($currentTopic['topic_type'] === 'feed') {
+					$this->extension->materialiseTopicSource((int)$topic['id'], $entry->id(), $result['new_event']);
+				} elseif ($currentTopic['topic_type'] === 'digest' || (bool)$currentTopic['show_verification']) {
+					$this->extension->synchroniseTopic((int)$topic['id'], $result['new_event']);
+				}
+				$this->markOriginalReadIfEligible($entry);
+				$matched = true;
+			} finally {
+				flock($topicLock, LOCK_UN);
+				fclose($topicLock);
 			}
 		}
 		$this->extension->finishRebuildForEntry($entry, $matched);
@@ -249,7 +354,38 @@ final class TopicDigestProcessor {
 	/** @param array<string,mixed> $job */
 	private function jobUsesCurrentPipeline(array $job): bool {
 		return $this->store->isCurrentJob($job)
+			&& $this->store->workerRestartRevision() === $this->workerRestartRevision
 			&& hash_equals((string)$job['pipeline_hash'], $this->extension->pipelineHash());
+	}
+
+	/** @param array<string,mixed> $job */
+	private function renewLease(array $job): void {
+		if ($this->store->workerRestartRevision() !== $this->workerRestartRevision
+				|| !$this->store->renewLease($job, max(600, (int)$this->config['timeout'] * 2))) {
+			throw new RuntimeException('Topic Digest job ownership was lost.');
+		}
+	}
+
+	/** @return resource */
+	private function acquireTopicLock(int $topicId, ?array $job = null) {
+		$heartbeat = $job === null ? null : function () use ($job): void {
+			$this->renewLease($job);
+		};
+		return $this->extension->acquireTopicLock($topicId, $heartbeat);
+	}
+
+	private function markOriginalReadIfEligible(FreshRSS_Entry $entry): void {
+		$entryDao = FreshRSS_Factory::createEntryDao();
+		$current = $entryDao->searchById($entry->id());
+		if ($current !== null && hash_equals($entry->hash(), $current->hash()) && !$current->isRead()
+				&& !$current->isFavorite() && !$this->store->isProtected($current->id())
+				&& ((method_exists($current, 'lastUserModified') && $current->lastUserModified() === null)
+					|| (!method_exists($current, 'lastUserModified') && $this->extension->supportsEntriesReadHook()))) {
+			$affected = $entryDao->markRead($current->id(), true);
+			if ($affected === false) {
+				throw new RuntimeException('Could not mark the matched source as read.');
+			}
+		}
 	}
 
 	/** @param array<string,mixed> $job @param list<float> $embedding @return list<array<string,mixed>> */
@@ -260,7 +396,7 @@ final class TopicDigestProcessor {
 			if (!$this->topicAccepts($topic, $job)) {
 				continue;
 			}
-			$topicEmbedding = $this->topicEmbedding($topic);
+			$topicEmbedding = $this->topicEmbedding($topic, $job);
 			$candidates[] = ['score' => self::cosine($embedding, $topicEmbedding), 'topic' => $topic,
 				'membership' => isset($memberships[(int)$topic['id']])];
 		}
@@ -297,6 +433,7 @@ final class TopicDigestProcessor {
 			}
 		}
 		foreach (array_chunk($uncached, 8) as $batch) {
+			$this->renewLease($job);
 			$batchDecisions = $this->ollama->matchTopics($judgeModel, $summary, $batch);
 			if (!$this->store->isCurrentJob($job)) {
 				return null;
@@ -337,12 +474,15 @@ final class TopicDigestProcessor {
 	}
 
 	/** @param array<string,mixed> $topic @return list<float> */
-	private function topicEmbedding(array &$topic): array {
+	private function topicEmbedding(array &$topic, ?array $job = null): array {
 		$stored = $topic['description_embedding'] ?? null;
 		if (is_string($stored) && $stored !== '') {
 			return $this->decodeEmbedding($stored);
 		}
 		$text = (string)$topic['description'] . "\nExclusions: " . implode('; ', $topic['exclusions']);
+		if ($job !== null) {
+			$this->renewLease($job);
+		}
 		$embedding = $this->ollama->embed((string)$this->config['embedding_model'], $text);
 		$this->store->saveTopicEmbedding((int)$topic['id'], (string)$topic['rule_hash'], $embedding);
 		return $embedding;
@@ -449,6 +589,7 @@ final class TopicDigestProcessor {
 			}
 		}
 		foreach (array_chunk($uncached, 10) as $batch) {
+			$this->renewLease($job);
 			$batchDecisions = $this->ollama->sameEvents($judgeModel, $summary, $batch);
 			if (!$this->store->isCurrentJob($job)) {
 				return null;

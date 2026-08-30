@@ -8,14 +8,20 @@ require_once __DIR__ . '/TopicDigestScraper.php';
 require_once __DIR__ . '/TopicDigestProcessor.php';
 
 /**
- * @phpstan-type TopicDigestConfig array{ollama_url:string,summary_model:string,judge_model:string,
- *  embedding_model:string,timeout:int,scraping:bool,always_show_topics:bool}
+ * @phpstan-type TopicDigestConfig array{ollama_profile:string,effective_ollama_profile:string,ollama_url:string,
+ *  summary_model:string,judge_model:string,embedding_model:string,structuring_model:string,timeout:int,scraping:bool,
+ *  always_show_topics:bool}
  */
 final class TopicDigestExtension extends Minz_Extension {
 	private const CATEGORY_NAME = 'Topic Digests';
 	private const DEFAULT_OLLAMA_TIMEOUT = 1800;
 	private const LEGACY_OLLAMA_TIMEOUT = 180;
 	private const MAX_OLLAMA_TIMEOUT = 7200;
+	private const OLLAMA_PROFILES = ['local', 'cloud'];
+	/** @var array<string,string> */
+	private const OLLAMA_PROFILE_DEFAULTS = ['ollama_url' => 'http://ollama:11434', 'summary_model' => 'qwen3.5:4b',
+		'judge_model' => 'qwen3.5:9b', 'embedding_model' => 'qwen3-embedding:0.6b'];
+	private const MAX_WORKER_LOG_BYTES = 131072;
 	private ?TopicDigestStore $storeInstance = null;
 	private ?FreshRSS_ArticleSummaryCache $summaryCacheInstance = null;
 	private bool $workerLaunchAttempted = false;
@@ -38,6 +44,12 @@ final class TopicDigestExtension extends Minz_Extension {
 	public array $status = [];
 	/** @var list<array<string,mixed>> */
 	public array $errors = [];
+	/** @var list<array{reason:string,count:int}> */
+	public array $skipReasons = [];
+	public string $workerLog = '';
+	public bool $workerLogTruncated = false;
+	/** @var array<int,int>|null Feed id => category id, memoised per request for enqueueBackfillPage(). */
+	private ?array $feedCategoriesCache = null;
 
 	#[\Override]
 	public function init(): void {
@@ -52,6 +64,10 @@ final class TopicDigestExtension extends Minz_Extension {
 			$this->registerHook(Minz_HookType::EntryBeforeInsert, [$this, 'enqueueEntry'], -100);
 		}
 		$this->registerHook(Minz_HookType::EntryBeforeUpdate, [$this, 'enqueueEntry'], -100);
+		// Filters run before EntryBeforeAdd/EntryBeforeUpdate, so this always records a match in time to skip it.
+		if (defined(Minz_HookType::class . '::EntryAutoRead')) {
+			$this->registerHook(constant(Minz_HookType::class . '::EntryAutoRead'), [$this, 'trackAutoReadByFilter']);
+		}
 		if ($this->supportsEntriesReadHook()) {
 			$this->registerHook(constant(Minz_HookType::class . '::EntriesRead'), [$this, 'entriesRead']);
 		}
@@ -132,15 +148,84 @@ final class TopicDigestExtension extends Minz_Extension {
 
 	/** @return TopicDigestConfig */
 	public function configuration(): array {
+		$profile = $this->effectiveOllamaProfile();
 		return [
-			'ollama_url' => $this->getUserConfigurationString('ollama_url') ?? 'http://ollama:11434',
-			'summary_model' => $this->getUserConfigurationString('summary_model') ?? 'qwen3.5:4b',
-			'judge_model' => $this->getUserConfigurationString('judge_model') ?? 'qwen3.5:9b',
-			'embedding_model' => $this->getUserConfigurationString('embedding_model') ?? 'qwen3-embedding:0.6b',
+			'ollama_profile' => $this->storedOllamaProfile(),
+			'effective_ollama_profile' => $profile,
+			'ollama_url' => $this->ollamaProfileValue($profile, 'ollama_url'),
+			'summary_model' => $this->ollamaProfileValue($profile, 'summary_model'),
+			'judge_model' => $this->ollamaProfileValue($profile, 'judge_model'),
+			'embedding_model' => $this->ollamaProfileValue($profile, 'embedding_model'),
+			'structuring_model' => $this->structuringModel(),
 			'timeout' => $this->ollamaTimeoutConfiguration(),
 			'scraping' => $this->getUserConfigurationBool('scraping') ?? true,
 			'always_show_topics' => $this->getUserConfigurationBool('always_show_topics') ?? true,
 		];
+	}
+
+	/** The user's saved preference, as shown/edited on the settings page. */
+	private function storedOllamaProfile(): string {
+		$profile = $this->getUserConfigurationString('ollama_profile') ?? 'local';
+		return in_array($profile, self::OLLAMA_PROFILES, true) ? $profile : 'local';
+	}
+
+	/**
+	 * The profile actually used for processing: the stored preference, unless it is "cloud" and Ollama Cloud
+	 * most recently rejected a request for account/plan reasons (HTTP 402/429), in which case "local" is used
+	 * automatically until the cooldown set by TopicDigestProcessor expires.
+	 */
+	private function effectiveOllamaProfile(): string {
+		$stored = $this->storedOllamaProfile();
+		if ($stored === 'cloud' && $this->store()->cloudUnavailableUntil() > time()) {
+			return 'local';
+		}
+		return $stored;
+	}
+
+	/** Unix timestamp until which processing is automatically using the local profile, or 0 if not in fallback. */
+	public function cloudFallbackUntil(): int {
+		return $this->storedOllamaProfile() === 'cloud' ? $this->store()->cloudUnavailableUntil() : 0;
+	}
+
+	/**
+	 * The model used to recover a structured reply, on the local Ollama endpoint, when a primary endpoint
+	 * (e.g. Ollama Cloud, which does not support the "format" JSON schema constraint) returns free text instead
+	 * of JSON. Defaults to the local profile's own summary model so this works with no extra setup.
+	 */
+	private function structuringModel(): string {
+		$configured = $this->getUserConfigurationString('structuring_model');
+		return $configured !== null && $configured !== '' ? $configured : $this->ollamaProfileValue('local', 'summary_model');
+	}
+
+	/** The raw, possibly-blank override, for rendering the settings field without locking in the computed default. */
+	public function structuringModelOverride(): string {
+		return $this->getUserConfigurationString('structuring_model') ?? '';
+	}
+
+	/**
+	 * Reads a single Ollama field for one profile, falling back to the pre-profile flat setting for
+	 * "local" (so existing installs keep working after upgrading) and to the built-in default otherwise.
+	 */
+	private function ollamaProfileValue(string $profile, string $field): string {
+		$value = $this->getUserConfigurationString("{$profile}_{$field}");
+		if ($value !== null) {
+			return $value;
+		}
+		if ($profile === 'local') {
+			return $this->getUserConfigurationString($field) ?? self::OLLAMA_PROFILE_DEFAULTS[$field];
+		}
+		return '';
+	}
+
+	/** @return array<string,array<string,string>> */
+	public function ollamaProfiles(): array {
+		$result = [];
+		foreach (self::OLLAMA_PROFILES as $profile) {
+			foreach (self::OLLAMA_PROFILE_DEFAULTS as $field => $default) {
+				$result[$profile][$field] = $this->ollamaProfileValue($profile, $field);
+			}
+		}
+		return $result;
 	}
 
 	private function ollamaTimeoutConfiguration(): int {
@@ -151,29 +236,124 @@ final class TopicDigestExtension extends Minz_Extension {
 		return min(self::MAX_OLLAMA_TIMEOUT, max(10, $timeout));
 	}
 
+	/**
+	 * The models the user has actually configured, ignoring any temporary automatic cloud->local fallback.
+	 *
+	 * pipelineHash()/analysisHash() must be derived from these, never from the *effective* profile: the automatic
+	 * fallback flips back and forth on its own every cooldown, and hashing the effective profile made every one of
+	 * those flips invalidate the stored hash of every queued job at once. Each job then took the "pipeline changed"
+	 * branch, re-queued itself and did no classification at all, so with a backlog larger than one cooldown's worth
+	 * of work the queue could never converge: it churned quickly (no Ollama call on that branch) while matching
+	 * nothing, and every summary and embedding was recomputed on each flip.
+	 *
+	 * @return array{summary_model:string,judge_model:string,embedding_model:string}
+	 */
+	private function storedProfileModels(): array {
+		$profile = $this->storedOllamaProfile();
+		return [
+			'summary_model' => $this->ollamaProfileValue($profile, 'summary_model'),
+			'judge_model' => $this->ollamaProfileValue($profile, 'judge_model'),
+			'embedding_model' => $this->ollamaProfileValue($profile, 'embedding_model'),
+		];
+	}
+
 	public function pipelineHash(): string {
-		$config = $this->configuration();
+		$models = $this->storedProfileModels();
+		$scraping = $this->getUserConfigurationBool('scraping') ?? true;
 		$topics = array_map(static fn(array $topic): array => [
 			$topic['id'], $topic['rule_hash'], $topic['enabled'], $topic['all_feeds'], $topic['all_categories'],
 			$topic['feed_ids'], $topic['category_ids'], $topic['backfill_mode'], $topic['backfill_days'], $topic['topic_type'],
 			$topic['show_verification'],
 		], $this->store()->topics());
-		return hash('sha256', json_encode([$config['summary_model'], $config['judge_model'],
-			$config['embedding_model'], $config['scraping'], $this->store()->pipelineRevision(), $topics], JSON_THROW_ON_ERROR));
+		return hash('sha256', json_encode([$models['summary_model'], $models['judge_model'],
+			$models['embedding_model'], $scraping, $this->store()->pipelineRevision(), $topics], JSON_THROW_ON_ERROR));
 	}
 
 	public function analysisHash(): string {
-		$config = $this->configuration();
-		return hash('sha256', json_encode([$config['summary_model'], $config['embedding_model'], $config['scraping']],
-			JSON_THROW_ON_ERROR));
+		$models = $this->storedProfileModels();
+		return hash('sha256', json_encode([$models['summary_model'], $models['embedding_model'],
+			$this->getUserConfigurationBool('scraping') ?? true], JSON_THROW_ON_ERROR));
 	}
 
 	public function lockPath(): string {
 		return $this->getExtensionUserPath() . '/worker.lock';
 	}
 
+	/** Records a FreshRSS filter's auto-read match so enqueueEntry() can skip queuing that article. */
+	public function trackAutoReadByFilter(FreshRSS_Entry $entry, string $why): void {
+		if ($why !== 'filter') {
+			return;
+		}
+		try {
+			$this->store()->markFilterRead($entry->id());
+		} catch (Throwable $e) {
+			Minz_Log::error('Topic Digest filter-read tracking error: ' . $e->getMessage());
+		}
+	}
+
+	/**
+	 * Whether a currently-configured "mark as read" filter (global, category, or feed) would match this entry.
+	 * Used as a fallback when there is no live-observed record for it (e.g. it was read before this exclusion
+	 * existed): re-deriving the answer from the current rules is the only thing FreshRSS's own data allows,
+	 * since it does not persist *why* an entry became read.
+	 */
+	private function wouldMatchReadFilter(FreshRSS_Entry $entry): bool {
+		$feed = $entry->feed();
+		if ($feed === null) {
+			return false;
+		}
+		foreach (FreshRSS_Context::userConf()->filtersAction('read') as $booleanSearch) {
+			if ($entry->matches($booleanSearch)) {
+				return true;
+			}
+		}
+		$category = $feed->category();
+		if ($category !== null) {
+			foreach ($category->filtersAction('read') as $booleanSearch) {
+				if ($entry->matches($booleanSearch)) {
+					return true;
+				}
+			}
+		}
+		foreach ($feed->filtersAction('read') as $booleanSearch) {
+			if ($entry->matches($booleanSearch)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Whether this entry is known (live-observed, or re-derived by checking the entry against the feed's,
+	 * category's, and global current "mark as read" filters) to have been auto-read by a FreshRSS filter.
+	 * Persists a newly-derived match so future checks (including a later reprocessing pass, e.g. from
+	 * "Restart and rebuild Topic Digest") skip straight to the fast path.
+	 */
+	public function isFilterReadEntry(FreshRSS_Entry $entry): bool {
+		if (!$entry->isRead()) {
+			// An unread entry cannot have been auto-read by a filter. Checking this before trusting the stored
+			// marker matters because EntryAutoRead fires with the entry's *provisional* id, which FreshRSS may
+			// later assign to a different article: without this, that unrelated article would inherit the marker
+			// and be skipped (and un-read) as though a filter had read it.
+			return false;
+		}
+		if ($this->store()->isFilterRead($entry->id())) {
+			return true;
+		}
+		try {
+			if ($this->wouldMatchReadFilter($entry)) {
+				$this->store()->markFilterRead($entry->id());
+				return true;
+			}
+		} catch (Throwable $e) {
+			Minz_Log::error('Topic Digest read-filter recheck error: ' . $e->getMessage());
+		}
+		return false;
+	}
+
 	public function enqueueEntry(FreshRSS_Entry $entry): FreshRSS_Entry {
-		if ($this->isSyntheticFeed($entry->feedId()) || $this->store()->topics(true) === []) {
+		if ($this->isSyntheticFeed($entry->feedId()) || $this->store()->topics(true) === []
+				|| $this->isFilterReadEntry($entry)) {
 			return $entry;
 		}
 		try {
@@ -253,10 +433,15 @@ final class TopicDigestExtension extends Minz_Extension {
 			return 0;
 		}
 		$limit = max(1, min(100, $pageSize));
-		$feedCategories = [];
-		foreach (FreshRSS_Factory::createFeedDao()->selectAll() as $feed) {
-			$feedCategories[(int)$feed['id']] = (int)$feed['category'];
+		// Memoised per request: this is called in a tight loop (the whole backfill is now enqueued up front),
+		// and the feed list rarely changes mid-scan.
+		if ($this->feedCategoriesCache === null) {
+			$this->feedCategoriesCache = [];
+			foreach (FreshRSS_Factory::createFeedDao()->selectAll() as $feed) {
+				$this->feedCategoriesCache[(int)$feed['id']] = (int)$feed['category'];
+			}
 		}
+		$feedCategories = $this->feedCategoriesCache;
 		$count = 0;
 		$lastId = null;
 		$pipelineHash = $this->pipelineHash();
@@ -359,10 +544,15 @@ final class TopicDigestExtension extends Minz_Extension {
 			throw new RuntimeException('Could not reload the synthetic Topic Digest feed.');
 		}
 		if ($topic['topic_type'] === 'feed') {
-			$detachedOverview = $this->synchroniseHighPriorityFeed($topic, $feedId, $prune);
+			$seenAt = $this->generatedEntrySeenAt($feedId, $prune);
+			$this->synchroniseHighPriorityFeed($topic, $feedId, $prune, $seenAt);
 			$overview = $this->synchroniseOverviewEntry(
-				$topic, $feedId, $markUnread, $preservedOverview ?? $detachedOverview, true
+				$topic, $feedId, $markUnread, $preservedOverview, true, $seenAt
 			);
+			if ($prune) {
+				// Only after every entry that should survive has been (re-)written with $seenAt.
+				$this->pruneGeneratedEntries($feedId);
+			}
 			$this->store()->attachSynthetic($topicId, $feedId, $overview->id());
 			$feedDao->updateCachedValues($feedId);
 			FreshRSS_UserDAO::touch();
@@ -382,7 +572,7 @@ final class TopicDigestExtension extends Minz_Extension {
 	}
 
 	/** @param array<string,mixed> $topic */
-	private function synchroniseHighPriorityFeed(array $topic, int $feedId, bool $prune): ?FreshRSS_Entry {
+	private function synchroniseHighPriorityFeed(array $topic, int $feedId, bool $prune, int $seenAt): void {
 		$entryDao = FreshRSS_Factory::createEntryDao();
 		$sourceIds = [];
 		foreach ($this->store()->events((int)$topic['id']) as $event) {
@@ -391,24 +581,53 @@ final class TopicDigestExtension extends Minz_Extension {
 			}
 		}
 		$existing = [];
-		$detachedOverview = null;
 		if ($prune) {
 			foreach ($entryDao->listWhere(type: 'f', id: $feedId, state: FreshRSS_Entry::STATE_ALL, limit: -1) as $entry) {
-				if ($entry->guid() === $this->topicOverviewGuid((int)$topic['id'])) {
-					$detachedOverview = $entry;
-				} else {
-					$existing[$entry->guid()] = $entry;
-				}
-			}
-			if ($entryDao->cleanOldEntries($feedId) === false) {
-				throw new RuntimeException('Could not reconcile the high-priority Topic Digest feed.');
+				$existing[$entry->guid()] = $entry;
 			}
 		}
 		foreach (array_values(array_unique($sourceIds)) as $sourceId) {
 			$guid = $this->topicSourceGuid((int)$topic['id'], $sourceId);
-			$this->materialiseHighPriorityEntry($topic, $feedId, $sourceId, $existing[$guid] ?? null);
+			$this->materialiseHighPriorityEntry($topic, $feedId, $sourceId, $seenAt, $existing[$guid] ?? null);
 		}
-		return $detachedOverview;
+	}
+
+	/**
+	 * A lastSeen value strictly newer than every entry currently in the feed. Stamping it on each entry that
+	 * should survive is what makes pruneGeneratedEntries() below delete exactly the rest.
+	 */
+	private function generatedEntrySeenAt(int $feedId, bool $prune): int {
+		$now = time();
+		if (!$prune) {
+			return $now;
+		}
+		$newest = 0;
+		foreach (FreshRSS_Factory::createEntryDao()->listWhere(type: 'f', id: $feedId,
+				state: FreshRSS_Entry::STATE_ALL, limit: -1) as $entry) {
+			$newest = max($newest, $entry->lastSeen());
+		}
+		return max($now, $newest + 1);
+	}
+
+	/**
+	 * Removes the generated articles this synchronisation did not just re-write, i.e. those whose topic
+	 * membership is gone — most of them at once after a rebuild clears every membership.
+	 *
+	 * FreshRSS's only entry-deletion API is cleanOldEntries(), which always keeps everything carrying the feed's
+	 * highest lastSeen (its "seen at the last refresh" guard) and, called with no options, also appends a literal
+	 * "AND (1=0)" and so deletes nothing whatsoever. That is why this pruning silently never removed anything,
+	 * leaving high-priority feeds full of unread articles belonging to topics with no matches left. Re-writing
+	 * every surviving entry with one fresh lastSeen first turns that guard into precisely the rule needed here.
+	 * Favourites are kept, like everywhere else in this extension.
+	 */
+	private function pruneGeneratedEntries(int $feedId): void {
+		$removed = FreshRSS_Factory::createEntryDao()->cleanOldEntries($feedId, [
+			'keep_period' => 'PT0S',
+			'keep_favourites' => true,
+		]);
+		if ($removed === false) {
+			throw new RuntimeException('Could not remove stale articles from the high-priority Topic Digest feed.');
+		}
 	}
 
 	public function materialiseTopicSource(int $topicId, string $sourceEntryId, bool $markOverviewUnread): void {
@@ -421,15 +640,16 @@ final class TopicDigestExtension extends Minz_Extension {
 			$this->synchroniseTopic($topicId, false);
 			return;
 		}
-		$this->materialiseHighPriorityEntry($topic, $feedId, $sourceEntryId);
-		$overview = $this->synchroniseOverviewEntry($topic, $feedId, $markOverviewUnread, pinned: true);
+		$seenAt = time();
+		$this->materialiseHighPriorityEntry($topic, $feedId, $sourceEntryId, $seenAt);
+		$overview = $this->synchroniseOverviewEntry($topic, $feedId, $markOverviewUnread, pinned: true, seenAt: $seenAt);
 		$this->store()->attachSynthetic($topicId, $feedId, $overview->id());
 		FreshRSS_Factory::createFeedDao()->updateCachedValues($feedId);
 		FreshRSS_UserDAO::touch();
 	}
 
 	/** @param array<string,mixed> $topic */
-	private function materialiseHighPriorityEntry(array $topic, int $feedId, string $sourceEntryId,
+	private function materialiseHighPriorityEntry(array $topic, int $feedId, string $sourceEntryId, int $seenAt,
 		?FreshRSS_Entry $previous = null): void {
 		$entryDao = FreshRSS_Factory::createEntryDao();
 		$guid = $this->topicSourceGuid((int)$topic['id'], $sourceEntryId);
@@ -452,6 +672,9 @@ final class TopicDigestExtension extends Minz_Extension {
 		$values['is_read'] = $previous?->isRead() ?? false;
 		$values['is_favorite'] = $previous?->isFavorite() ?? false;
 		$values['lastUserModified'] = $previous?->lastUserModified();
+		// Marks this entry as still wanted, so a following pruneGeneratedEntries() spares it. Without it the
+		// value copied from the source article (or from the previous copy) leaves it looking stale.
+		$values['lastSeen'] = $seenAt;
 		if ($previous === null) {
 			if (!$entryDao->addEntry($values, false)) {
 				throw new RuntimeException('Could not add an article to the high-priority Topic Digest feed.');
@@ -467,7 +690,8 @@ final class TopicDigestExtension extends Minz_Extension {
 
 	/** @param array<string,mixed> $topic */
 	private function synchroniseOverviewEntry(array $topic, int $feedId, bool $markUnread,
-		?FreshRSS_Entry $detached = null, bool $pinned = false): FreshRSS_Entry {
+		?FreshRSS_Entry $detached = null, bool $pinned = false, ?int $seenAt = null): FreshRSS_Entry {
+		$seenAt ??= time();
 		$entryDao = FreshRSS_Factory::createEntryDao();
 		$guid = $this->topicOverviewGuid((int)$topic['id']);
 		$entry = $detached ?? $entryDao->searchByGuid($feedId, $guid);
@@ -479,7 +703,7 @@ final class TopicDigestExtension extends Minz_Extension {
 			$entry = new FreshRSS_Entry($feedId, $guid, (string)$topic['name'], 'Topic Digest', $content,
 				'https://topic-digest.invalid/topic/' . $topic['id'], $date, !$startsUnread, false);
 			$entry->_id(uTimeString());
-			$entry->_lastSeen(time());
+			$entry->_lastSeen($seenAt);
 			if (!$entryDao->addEntry($entry->toArray(), false)) {
 				throw new RuntimeException('Could not create the living Topic Digest overview entry.');
 			}
@@ -494,6 +718,8 @@ final class TopicDigestExtension extends Minz_Extension {
 		}
 		$values = $entry->toArray();
 		$values['id_feed'] = $feedId;
+		// The overview must never look stale to pruneGeneratedEntries(); it is the one entry that always survives.
+		$values['lastSeen'] = $seenAt;
 		if ($detached !== null) {
 			if (!$entryDao->addEntry($values, false)) {
 				throw new RuntimeException('Could not restore the living Topic Digest overview entry.');
@@ -700,7 +926,7 @@ final class TopicDigestExtension extends Minz_Extension {
 	/** @param array<string,string> $parameters */
 	private function actionForm(string $action, int $topicId, string $label, array $parameters): string {
 		$url = _url('topicDigest', $action);
-		$html = '<form class="topic-digest-action" method="post" action="' . htmlspecialchars($url, ENT_QUOTES, 'UTF-8') . '">'
+		$html = '<form class="topic-digest-action" method="post" action="' . $url . '">'
 			. '<input type="hidden" name="_csrf" value="' . htmlspecialchars(FreshRSS_Auth::csrfToken(), ENT_QUOTES, 'UTF-8') . '" />'
 			. '<input type="hidden" name="topic_id" value="' . $topicId . '" />';
 		foreach ($parameters as $key => $value) {
@@ -711,7 +937,8 @@ final class TopicDigestExtension extends Minz_Extension {
 			. '</button></form>';
 	}
 
-	private function safeUrl(string $url): ?string {
+	/** Returns the URL only when it is a plain http(s) link safe to render as an href, otherwise null. */
+	public function safeUrl(string $url): ?string {
 		$parts = parse_url($url);
 		return is_array($parts) && in_array(strtolower((string)($parts['scheme'] ?? '')), ['http', 'https'], true)
 			&& !empty($parts['host']) && !isset($parts['user']) && !isset($parts['pass']) ? $url : null;
@@ -837,20 +1064,24 @@ final class TopicDigestExtension extends Minz_Extension {
 		if ((int)($status['paused'] ?? 0) !== 0) {
 			return _t('ext.topic_digest.estimate_paused');
 		}
-		if ((int)($status['queued'] ?? 0) === 0 && (int)($status['backfill_active'] ?? 0) === 0) {
-			return _t('ext.topic_digest.estimate_complete');
+		$queued = (int)($status['queued'] ?? 0);
+		$backfilling = (int)($status['backfill_active'] ?? 0) !== 0;
+		if ($queued === 0) {
+			return $backfilling ? _t('ext.topic_digest.estimate_calculating') : _t('ext.topic_digest.estimate_complete');
 		}
 		$rate = (float)($status['average_per_hour'] ?? 0.0);
-		if ((int)($status['backfill_active'] ?? 0) !== 0 || $rate <= 0.0) {
+		if ($rate <= 0.0) {
 			return _t('ext.topic_digest.estimate_calculating');
 		}
-		$minutes = max(1, (int)ceil(((int)$status['queued'] / $rate) * 60));
+		$minutes = max(1, (int)ceil(($queued / $rate) * 60));
 		$days = intdiv($minutes, 1440);
 		$hours = intdiv($minutes % 1440, 60);
 		$remainingMinutes = $minutes % 60;
 		$duration = $days > 0 ? "{$days}d {$hours}h"
 			: ($hours > 0 ? "{$hours}h {$remainingMinutes}min" : "{$remainingMinutes}min");
-		return _t('ext.topic_digest.estimated_duration', $duration);
+		return $backfilling
+			? _t('ext.topic_digest.estimated_duration_backfilling', $duration)
+			: _t('ext.topic_digest.estimated_duration', $duration);
 	}
 
 	#[\Override]
@@ -864,13 +1095,10 @@ final class TopicDigestExtension extends Minz_Extension {
 		if (Minz_Request::isPost()) {
 			$this->handlePost(Minz_Request::paramString('topic_digest_action'));
 		}
-		foreach ($this->store()->topics() as $topic) {
-			try {
-				$this->synchroniseTopic((int)$topic['id'], false);
-			} catch (Throwable $e) {
-				Minz_Log::error('Topic Digest reconciliation error: ' . $e->getMessage());
-			}
-		}
+		// Only re-synchronise topics whose FreshRSS objects are actually missing or stale. Doing it unconditionally
+		// rewrote every synthetic feed, its overview entry, and every materialised article on every settings page
+		// load, which is a heavy write burst competing with the worker for the SQLite write lock.
+		$this->reconcileMissingTopics();
 		$this->settings = $this->configuration();
 		$this->topics = $this->store()->topics();
 		foreach ($this->topics as &$topic) {
@@ -883,6 +1111,8 @@ final class TopicDigestExtension extends Minz_Extension {
 			fn(FreshRSS_Feed $feed): bool => !$this->isSyntheticFeed($feed->id())));
 		$this->status = $this->store()->status();
 		$this->errors = $this->store()->recentErrors();
+		$this->skipReasons = $this->store()->skipReasons();
+		$this->loadWorkerLog();
 		$this->launchAutomaticWorker();
 	}
 
@@ -898,28 +1128,42 @@ final class TopicDigestExtension extends Minz_Extension {
 			}
 		} elseif ($action === 'save_settings') {
 			$previousConfig = $this->configuration();
-			$url = rtrim(Minz_Request::paramString('ollama_url', plaintext: true), '/');
-			$models = [Minz_Request::paramString('summary_model', plaintext: true),
-				Minz_Request::paramString('judge_model', plaintext: true), Minz_Request::paramString('embedding_model', plaintext: true)];
-			if (!$this->validOllamaUrl($url) || count(array_filter($models, [$this, 'validModelName'])) !== 3) {
-				Minz_Request::bad('Invalid Ollama URL or model name.');
+			$profile = Minz_Request::paramString('ollama_profile', plaintext: true);
+			if (!in_array($profile, self::OLLAMA_PROFILES, true)) {
+				Minz_Request::bad('Invalid Ollama profile.');
+			}
+			$values = ['ollama_profile' => $profile];
+			foreach (self::OLLAMA_PROFILES as $key) {
+				$url = rtrim(Minz_Request::paramString("{$key}_ollama_url", plaintext: true), '/');
+				$models = [Minz_Request::paramString("{$key}_summary_model", plaintext: true),
+					Minz_Request::paramString("{$key}_judge_model", plaintext: true),
+					Minz_Request::paramString("{$key}_embedding_model", plaintext: true)];
+				$blank = $url === '' && count(array_filter($models, static fn(string $m): bool => trim($m) !== '')) === 0;
+				if (($key === $profile || !$blank)
+						&& (!$this->validOllamaUrl($url) || count(array_filter($models, [$this, 'validModelName'])) !== 3)) {
+					Minz_Request::bad("Invalid Ollama URL or model name for the {$key} profile.");
+				}
+				$values["{$key}_ollama_url"] = $url;
+				$values["{$key}_summary_model"] = trim($models[0]);
+				$values["{$key}_judge_model"] = trim($models[1]);
+				$values["{$key}_embedding_model"] = trim($models[2]);
+			}
+			$structuringModel = trim(Minz_Request::paramString('structuring_model', plaintext: true));
+			if ($structuringModel !== '' && !$this->validModelName($structuringModel)) {
+				Minz_Request::bad('Invalid structuring model name.');
 			}
 			/** @phpstan-ignore method.deprecated */
-			$this->setUserConfiguration(['ollama_url' => $url, 'summary_model' => trim($models[0]),
-				'judge_model' => trim($models[1]), 'embedding_model' => trim($models[2]),
+			$this->setUserConfiguration([...$values, 'structuring_model' => $structuringModel,
 				'timeout' => min(self::MAX_OLLAMA_TIMEOUT, max(10, Minz_Request::paramInt('timeout'))),
 				'scraping' => Minz_Request::paramBoolean('scraping'),
 				'always_show_topics' => $previousConfig['always_show_topics']]);
-			if (!hash_equals($previousConfig['embedding_model'], trim($models[2]))) {
+			if (!hash_equals($previousConfig['embedding_model'], $values["{$profile}_embedding_model"])) {
 				$this->store()->invalidateEmbeddings();
 			}
 			$this->store()->startBackfill();
 			Minz_Request::good(_t('feedback.conf.updated'), $this->settingsRedirect());
 		} elseif ($action === 'save_display_settings') {
-			$config = $this->configuration();
-			$config['always_show_topics'] = Minz_Request::paramBoolean('always_show_topics');
-			/** @phpstan-ignore method.deprecated */
-			$this->setUserConfiguration($config);
+			$this->setUserConfigurationValue('always_show_topics', Minz_Request::paramBoolean('always_show_topics'));
 			Minz_Request::good(_t('feedback.conf.updated'), $this->settingsRedirect());
 		} elseif ($action === 'save_topic') {
 			$id = Minz_Request::paramInt('topic_id');
@@ -950,7 +1194,14 @@ final class TopicDigestExtension extends Minz_Extension {
 			$this->store()->startBackfill();
 		} elseif ($action === 'retry') {
 			$this->store()->retryFailed();
+		} elseif ($action === 'retry_skipped') {
+			$this->store()->retrySkipped();
+			$this->workerLaunchAttempted = false;
+			$this->launchAutomaticWorker();
 		} elseif ($action === 'restart') {
+			// Pausing here is only to keep the worker out of the rebuild; restore whatever the user had chosen
+			// rather than silently resuming a worker they had deliberately paused.
+			$wasPaused = $this->store()->isPaused();
 			$this->store()->setPaused(true);
 			try {
 				$this->store()->rebuildDigests();
@@ -960,7 +1211,7 @@ final class TopicDigestExtension extends Minz_Extension {
 				}
 				$this->store()->requestWorkerRestart();
 			} finally {
-				$this->store()->setPaused(false);
+				$this->store()->setPaused($wasPaused);
 			}
 			$this->workerLaunchAttempted = false;
 			$this->launchAutomaticWorker();
@@ -983,8 +1234,9 @@ final class TopicDigestExtension extends Minz_Extension {
 				: 'Recent matches: ' . implode('; ', $names));
 		} elseif ($action === 'suggestion') {
 			$topicId = Minz_Request::paramInt('topic_id');
+			$edited = Minz_Request::paramString('suggestion_text', plaintext: true);
 			$this->store()->resolveSuggestion($topicId, Minz_Request::paramInt('suggestion_id'),
-				Minz_Request::paramString('decision') === 'approve');
+				Minz_Request::paramString('decision') === 'approve', $edited === '' ? null : $edited);
 			$this->synchroniseTopic($topicId, false);
 		} elseif ($action === 'delete' || $action === 'restore_delete') {
 			$topicId = Minz_Request::paramInt('topic_id');
@@ -1007,9 +1259,12 @@ final class TopicDigestExtension extends Minz_Extension {
 			$this->store()->deleteTopic($topicId);
 			$this->syntheticFeedIds = null;
 		} elseif ($action === 'test') {
+			// Test the saved preference, not any automatic cloud-cooldown fallback, so this always reflects the
+			// profile the user is actually looking at.
 			$config = $this->configuration();
-			(new TopicDigestOllama($config['ollama_url'], $config['timeout']))->test([
-				$config['summary_model'], $config['judge_model'], $config['embedding_model'],
+			$tested = $this->ollamaProfiles()[$config['ollama_profile']];
+			(new TopicDigestOllama($tested['ollama_url'], $config['timeout']))->test([
+				$tested['summary_model'], $tested['judge_model'], $tested['embedding_model'],
 			]);
 			Minz_Request::good('Ollama connection and models are available.');
 		} else {
@@ -1030,10 +1285,45 @@ final class TopicDigestExtension extends Minz_Extension {
 			&& !isset($parts['query']) && !isset($parts['fragment']);
 	}
 
+	public function maxWorkerLogKilobytes(): int {
+		return (int)round(self::MAX_WORKER_LOG_BYTES / 1024);
+	}
+
+	private function workerLogPath(): string {
+		return $this->getExtensionUserPath() . '/worker.log';
+	}
+
 	private function resetWorkerLog(): void {
-		$path = $this->getExtensionUserPath() . '/worker.log';
+		$path = $this->workerLogPath();
 		if (is_file($path) && file_put_contents($path, '', LOCK_EX) === false) {
 			throw new RuntimeException('Could not reset the Topic Digest worker log.');
+		}
+	}
+
+	private function loadWorkerLog(): void {
+		$path = $this->workerLogPath();
+		$size = is_file($path) ? (filesize($path) ?: 0) : 0;
+		$this->workerLogTruncated = $size > self::MAX_WORKER_LOG_BYTES;
+		if ($size === 0) {
+			$this->workerLog = '';
+			return;
+		}
+		$handle = fopen($path, 'rb');
+		if ($handle === false) {
+			$this->workerLog = '';
+			return;
+		}
+		try {
+			fseek($handle, max(0, $size - self::MAX_WORKER_LOG_BYTES));
+			$content = stream_get_contents($handle);
+			$content = $content === false ? '' : $content;
+			if ($this->workerLogTruncated) {
+				$firstBreak = strpos($content, "\n");
+				$content = $firstBreak === false ? $content : substr($content, $firstBreak + 1);
+			}
+			$this->workerLog = $content;
+		} finally {
+			fclose($handle);
 		}
 	}
 

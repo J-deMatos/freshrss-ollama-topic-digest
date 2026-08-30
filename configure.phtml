@@ -16,18 +16,50 @@
 <h2><?= _t('ext.topic_digest.title') ?></h2>
 <p><?= _t('ext.topic_digest.intro') ?></p>
 
+<?php $ollamaProfiles = $this->ollamaProfiles(); ?>
 <details>
 	<summary><strong><?= _t('ext.topic_digest.ollama') ?></strong></summary>
-	<form action="<?= $action ?>" method="post">
+	<form action="<?= $action ?>" method="post" data-ollama-profile-form="1">
 		<input type="hidden" name="_csrf" value="<?= FreshRSS_Auth::csrfToken() ?>" />
 		<input type="hidden" name="topic_digest_action" value="save_settings" />
-		<?php foreach (['ollama_url', 'summary_model', 'judge_model', 'embedding_model'] as $field): ?>
-			<div class="form-group">
-				<label class="group-name" for="<?= $field ?>"><?= _t('ext.topic_digest.' . $field) ?></label>
-				<div class="group-controls"><input class="w100" id="<?= $field ?>" name="<?= $field ?>"
-					value="<?= $esc((string)$this->settings[$field]) ?>" required="required" /></div>
+		<div class="form-group">
+			<div class="group-name"><?= _t('ext.topic_digest.ollama_profile') ?></div>
+			<div class="group-controls">
+				<?php foreach (['local', 'cloud'] as $profileKey): ?>
+					<label><input type="radio" name="ollama_profile" value="<?= $profileKey ?>" data-ollama-profile-radio="1"
+						<?= $this->settings['ollama_profile'] === $profileKey ? 'checked="checked"' : '' ?> />
+						<?= _t('ext.topic_digest.ollama_profile_' . $profileKey) ?></label>
+				<?php endforeach; ?>
+				<p class="help"><?= _t('ext.topic_digest.ollama_profile_help') ?></p>
+				<?php $cloudFallbackUntil = $this->cloudFallbackUntil(); ?>
+				<?php if ($cloudFallbackUntil > time()): ?>
+					<p class="alert alert-warn"><?= _t('ext.topic_digest.cloud_fallback_active',
+						date('Y-m-d H:i', $cloudFallbackUntil)) ?></p>
+				<?php endif; ?>
 			</div>
+		</div>
+		<?php foreach (['local', 'cloud'] as $profileKey): ?>
+			<fieldset data-ollama-profile-fields="<?= $profileKey ?>">
+				<legend><?= _t('ext.topic_digest.ollama_profile_' . $profileKey) ?></legend>
+				<?php foreach (['ollama_url', 'summary_model', 'judge_model', 'embedding_model'] as $field): ?>
+					<div class="form-group">
+						<label class="group-name" for="<?= $profileKey ?>_<?= $field ?>"><?= _t('ext.topic_digest.' . $field) ?></label>
+						<div class="group-controls"><input class="w100" id="<?= $profileKey ?>_<?= $field ?>"
+							name="<?= $profileKey ?>_<?= $field ?>"
+							value="<?= $esc($ollamaProfiles[$profileKey][$field]) ?>" /></div>
+					</div>
+				<?php endforeach; ?>
+			</fieldset>
 		<?php endforeach; ?>
+		<div class="form-group">
+			<label class="group-name" for="structuring_model"><?= _t('ext.topic_digest.structuring_model') ?></label>
+			<div class="group-controls">
+				<input class="w100" id="structuring_model" name="structuring_model"
+					placeholder="<?= $esc($this->settings['structuring_model']) ?>"
+					value="<?= $esc($this->structuringModelOverride()) ?>" />
+				<p class="help"><?= _t('ext.topic_digest.structuring_model_help') ?></p>
+			</div>
+		</div>
 		<div class="form-group">
 			<label class="group-name" for="timeout"><?= _t('ext.topic_digest.timeout') ?></label>
 			<div class="group-controls"><input type="number" id="timeout" name="timeout" min="10" max="7200"
@@ -160,8 +192,6 @@
 				<input type="hidden" name="enabled" value="<?= $item['enabled'] ? '0' : '1' ?>" />
 				<button class="btn" type="submit"><?= $item['enabled'] ? _t('ext.topic_digest.pause') : _t('ext.topic_digest.resume') ?></button></form>
 			<form action="<?= $action ?>" method="post"><input type="hidden" name="_csrf" value="<?= FreshRSS_Auth::csrfToken() ?>" />
-				<input type="hidden" name="topic_digest_action" value="rescan" /><button class="btn" type="submit"><?= _t('ext.topic_digest.rescan') ?></button></form>
-			<form action="<?= $action ?>" method="post"><input type="hidden" name="_csrf" value="<?= FreshRSS_Auth::csrfToken() ?>" />
 				<input type="hidden" name="topic_digest_action" value="preview" /><input type="hidden" name="topic_id" value="<?= (int)$item['id'] ?>" />
 				<button class="btn" type="submit"><?= _t('ext.topic_digest.preview') ?></button></form>
 			<?php foreach (['delete', 'restore_delete'] as $delete): ?>
@@ -171,13 +201,35 @@
 			<?php endforeach; ?>
 		</div>
 		<?php foreach ($item['suggestions'] as $suggestion): ?>
-			<div class="alert alert-warn"><strong><?= _t('ext.topic_digest.suggested_exclusion') ?>:</strong> <?= $esc((string)$suggestion['text']) ?>
-				<?php foreach (['approve', 'dismiss'] as $decision): ?>
-					<form class="topic-digest-action" action="<?= $action ?>" method="post"><input type="hidden" name="_csrf" value="<?= FreshRSS_Auth::csrfToken() ?>" />
-						<input type="hidden" name="topic_digest_action" value="suggestion" /><input type="hidden" name="topic_id" value="<?= (int)$item['id'] ?>" />
-						<input type="hidden" name="suggestion_id" value="<?= (int)$suggestion['id'] ?>" /><input type="hidden" name="decision" value="<?= $decision ?>" />
-						<button class="btn btn-mini" type="submit"><?= _t('ext.topic_digest.' . $decision) ?></button></form>
-				<?php endforeach; ?>
+			<?php
+				$suggestionId = 'topic-digest-suggestion-' . (int)$suggestion['id'];
+				$sourceTitle = (string)($suggestion['source_title'] ?? '');
+				$sourceLink = $this->safeUrl((string)($suggestion['source_link'] ?? ''));
+			?>
+			<div class="alert alert-warn topic-digest-suggestion">
+				<?php if ($sourceTitle !== ''): ?>
+					<p class="topic-digest-suggestion-source"><?= _t('ext.topic_digest.suggestion_from_article') ?>:
+						<?php if ($sourceLink !== null): ?>
+							<a href="<?= $esc($sourceLink) ?>" rel="noopener noreferrer"><?= $esc($sourceTitle) ?></a>
+						<?php else: ?>
+							<?= $esc($sourceTitle) ?>
+						<?php endif; ?>
+					</p>
+				<?php endif; ?>
+				<form class="topic-digest-suggestion-form" action="<?= $action ?>" method="post">
+					<input type="hidden" name="_csrf" value="<?= FreshRSS_Auth::csrfToken() ?>" />
+					<input type="hidden" name="topic_digest_action" value="suggestion" />
+					<input type="hidden" name="topic_id" value="<?= (int)$item['id'] ?>" />
+					<input type="hidden" name="suggestion_id" value="<?= (int)$suggestion['id'] ?>" />
+					<label class="group-name" for="<?= $suggestionId ?>"><?= _t('ext.topic_digest.suggested_exclusion') ?></label>
+					<textarea class="w100" id="<?= $suggestionId ?>" name="suggestion_text" rows="2"
+						maxlength="1000"><?= $esc((string)$suggestion['text']) ?></textarea>
+					<p class="help"><?= _t('ext.topic_digest.suggested_exclusion_help') ?></p>
+					<button class="btn btn-mini btn-important" type="submit" name="decision" value="approve"><?=
+						_t('ext.topic_digest.approve') ?></button>
+					<button class="btn btn-mini" type="submit" name="decision" value="dismiss"><?=
+						_t('ext.topic_digest.dismiss') ?></button>
+				</form>
 			</div>
 		<?php endforeach; ?>
 	</section>
@@ -185,12 +237,36 @@
 
 <h3><?= _t('ext.topic_digest.status') ?></h3>
 <dl class="topic-digest-status">
-	<?php foreach (['topics', 'events', 'sources', 'queued', 'processing', 'processed', 'failed', 'backfill_active'] as $key): ?>
+	<?php foreach (['topics', 'events', 'sources', 'queued', 'processing', 'processed', 'done', 'skipped',
+			'retrying', 'failed', 'stale_discarded', 'backfill_active'] as $key): ?>
 		<dt><?= _t('ext.topic_digest.' . $key) ?></dt><dd><?= (int)($this->status[$key] ?? 0) ?></dd>
 	<?php endforeach; ?>
 </dl>
+
+<?php if ($this->skipReasons !== []): ?>
+	<h4><?= _t('ext.topic_digest.skip_reasons') ?></h4>
+	<p class="help"><?= _t('ext.topic_digest.skip_reasons_help') ?></p>
+	<dl class="topic-digest-status">
+		<?php foreach ($this->skipReasons as $skip): ?>
+			<dt><?= $esc($skip['reason'] === '' ? _t('ext.topic_digest.skip_reason_unrecorded') : $skip['reason']) ?></dt>
+			<dd><?= (int)$skip['count'] ?></dd>
+		<?php endforeach; ?>
+	</dl>
+<?php endif; ?>
 <form action="<?= $action ?>" method="post"><input type="hidden" name="_csrf" value="<?= FreshRSS_Auth::csrfToken() ?>" />
 	<input type="hidden" name="topic_digest_action" value="retry" /><button class="btn" type="submit"><?= _t('ext.topic_digest.retry') ?></button></form>
+<form class="topic-digest-action" action="<?= $action ?>" method="post">
+	<input type="hidden" name="_csrf" value="<?= FreshRSS_Auth::csrfToken() ?>" />
+	<input type="hidden" name="topic_digest_action" value="rescan" />
+	<button class="btn" type="submit"><?= _t('ext.topic_digest.rescan') ?></button>
+</form>
+<form class="topic-digest-action" action="<?= $action ?>" method="post">
+	<input type="hidden" name="_csrf" value="<?= FreshRSS_Auth::csrfToken() ?>" />
+	<input type="hidden" name="topic_digest_action" value="retry_skipped" />
+	<button class="btn" type="submit"><?= _t('ext.topic_digest.retry_skipped') ?></button>
+</form>
+<p class="help"><?= _t('ext.topic_digest.rescan_help') ?></p>
+<p class="help"><?= _t('ext.topic_digest.retry_skipped_help') ?></p>
 <form class="topic-digest-action" action="<?= $action ?>" method="post">
 	<input type="hidden" name="_csrf" value="<?= FreshRSS_Auth::csrfToken() ?>" />
 	<input type="hidden" name="topic_digest_action" value="<?= (int)($this->status['paused'] ?? 0) !== 0 ? 'resume' : 'pause' ?>" />
@@ -210,5 +286,29 @@
 
 <?php if ($this->errors !== []): ?>
 	<h4><?= _t('ext.topic_digest.recent_errors') ?></h4>
-	<ul><?php foreach ($this->errors as $error): ?><li><?= $esc((string)$error['title']) ?> — <?= $esc((string)$error['error']) ?></li><?php endforeach; ?></ul>
+	<ul class="topic-digest-errors">
+		<?php foreach ($this->errors as $error): ?>
+			<li>
+				<strong><?= $esc((string)$error['title']) ?></strong>
+				<small>
+					(<?= $esc(_t('ext.topic_digest.error_state_' . $error['state'])) ?>
+					· <?= _t('ext.topic_digest.attempts') ?>: <?= (int)$error['attempts'] ?>
+					· <?= $esc(date('Y-m-d H:i', (int)$error['updated_at'])) ?>)
+				</small>
+				<br /><code><?= $esc((string)$error['error']) ?></code>
+			</li>
+		<?php endforeach; ?>
+	</ul>
 <?php endif; ?>
+
+<details>
+	<summary><strong><?= _t('ext.topic_digest.view_complete_log') ?></strong></summary>
+	<?php if ($this->workerLog === ''): ?>
+		<p><?= _t('ext.topic_digest.complete_log_empty') ?></p>
+	<?php else: ?>
+		<?php if ($this->workerLogTruncated): ?>
+			<p class="help"><?= _t('ext.topic_digest.complete_log_truncated', $this->maxWorkerLogKilobytes()) ?></p>
+		<?php endif; ?>
+		<pre class="topic-digest-log"><?= $esc($this->workerLog) ?></pre>
+	<?php endif; ?>
+</details>

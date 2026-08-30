@@ -3,7 +3,14 @@ declare(strict_types=1);
 
 final class TopicDigestStore {
 	private const MAX_ATTEMPTS = 4;
+	// Bumped past the pre-existing hardcoded "6" (whose exact history is uncertain) so every installation is
+	// guaranteed to run the full (idempotent) migration body at least once more, picking up anything that may
+	// have been added to it without a matching version bump, before settling on this version going forward.
+	private const SCHEMA_VERSION = 11;
+	/** The reason recorded for a queue row that turned out to be bookkeeping residue rather than an article. */
+	public const STALE_JOB_REASON = 'Stale queue entry with no GUID to resolve it by.';
 	private PDO $pdo;
+	private int $discardedSkipsOnOpen = 0;
 
 	public function __construct(string $path) {
 		$directory = dirname($path);
@@ -21,6 +28,13 @@ final class TopicDigestStore {
 	}
 
 	private function migrate(): void {
+		// Every request/CLI process constructs a TopicDigestStore, so this must stay a near-instant no-op once
+		// already current: re-running the migration body (and especially its final write) on every construction
+		// contends for the write lock against a busy worker and can crash a concurrent process outright.
+		$version = (int)($this->pdo->query('PRAGMA user_version')->fetchColumn() ?: 0);
+		if ($version >= self::SCHEMA_VERSION) {
+			return;
+		}
 		$this->pdo->exec(<<<'SQL'
 			CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 			CREATE TABLE IF NOT EXISTS topics (
@@ -121,6 +135,8 @@ final class TopicDigestStore {
 				id INTEGER PRIMARY KEY AUTOINCREMENT,
 				topic_id INTEGER NOT NULL,
 				text TEXT NOT NULL,
+				source_title TEXT NOT NULL DEFAULT '',
+				source_link TEXT NOT NULL DEFAULT '',
 				state TEXT NOT NULL DEFAULT 'pending',
 				created_at INTEGER NOT NULL
 			);
@@ -130,6 +146,16 @@ final class TopicDigestStore {
 				created_at INTEGER NOT NULL
 			);
 			CREATE TABLE IF NOT EXISTS rebuild_restores (
+				entry_id TEXT PRIMARY KEY,
+				created_at INTEGER NOT NULL
+			);
+			CREATE TABLE IF NOT EXISTS rebuild_restore_topics (
+				entry_id TEXT NOT NULL,
+				topic_id INTEGER NOT NULL,
+				created_at INTEGER NOT NULL,
+				PRIMARY KEY(entry_id, topic_id)
+			);
+			CREATE TABLE IF NOT EXISTS filter_read_entries (
 				entry_id TEXT PRIMARY KEY,
 				created_at INTEGER NOT NULL
 			);
@@ -166,6 +192,11 @@ final class TopicDigestStore {
 		if (!$this->hasColumn('jobs', 'is_archive')) {
 			$this->pdo->exec('ALTER TABLE jobs ADD COLUMN is_archive INTEGER NOT NULL DEFAULT 0');
 		}
+		if (!$this->hasColumn('jobs', 'guid')) {
+			// Lets a stale entry_id (FreshRSS renumbers ids when committing new entries, after this was first
+			// captured) be re-resolved via FreshRSS_EntryDAO::searchIdByGuid() instead of wrongly treated as gone.
+			$this->pdo->exec("ALTER TABLE jobs ADD COLUMN guid TEXT NOT NULL DEFAULT ''");
+		}
 		if (!$this->hasColumn('jobs', 'processing_seconds')) {
 			$this->pdo->exec('ALTER TABLE jobs ADD COLUMN processing_seconds REAL NOT NULL DEFAULT 0');
 		}
@@ -189,13 +220,27 @@ final class TopicDigestStore {
 		if (!$this->hasColumn('rejections', 'occurred_at')) {
 			$this->pdo->exec('ALTER TABLE rejections ADD COLUMN occurred_at INTEGER NOT NULL DEFAULT 0');
 		}
+		foreach (['source_title', 'source_link'] as $column) {
+			if (!$this->hasColumn('suggestions', $column)) {
+				$this->pdo->exec("ALTER TABLE suggestions ADD COLUMN {$column} TEXT NOT NULL DEFAULT ''");
+			}
+		}
+		// Rows keyed by an id FreshRSS renumbered at commit time, queued before GUIDs were recorded and so with no
+		// way left to resolve them. They are bookkeeping artefacts rather than articles — the article itself is
+		// queued again under its current id by the archive scan — and counting them as processed-and-skipped
+		// misreported hundreds of deletions that never happened.
+		// Includes rows whose reason is blank: "Reset logs" used to erase it, so matching on the text alone left
+		// exactly the same artefacts behind under an unaccountable "(no reason recorded)" tally. Without a GUID
+		// none of them can be resolved, and an archive rescan can never reach them either — it only re-queues
+		// rows whose id still matches a live article — so they would otherwise sit there permanently.
+		$this->discardSkippedStaleRows();
 		if ($this->getMeta('processing_metrics_revision') !== '2') {
 			$this->setMeta('active_processing_seconds', '0');
 			$this->setMeta('active_processed_articles', '0');
 			$this->setMeta('processing_metrics_revision', '2');
 			$this->setMeta('processing_metrics_sample_revision', '0');
 		}
-		$this->pdo->exec('PRAGMA user_version = 6');
+		$this->pdo->exec('PRAGMA user_version = ' . self::SCHEMA_VERSION);
 	}
 
 	/** @param array<string,mixed> $values */
@@ -340,6 +385,11 @@ final class TopicDigestStore {
 			$now = time();
 			$this->pdo->exec('INSERT OR IGNORE INTO rebuild_restores(entry_id,created_at) '
 				. 'SELECT DISTINCT entry_id,' . $now . ' FROM sources');
+			// Recorded per topic (not just per entry) so a restart's reclassification is guaranteed to re-ask
+			// about every topic an article previously matched, even one that no longer ranks in the embedding
+			// similarity shortlist once "sources" below is cleared out.
+			$this->pdo->exec('INSERT OR IGNORE INTO rebuild_restore_topics(entry_id,topic_id,created_at) '
+				. 'SELECT entry_id,topic_id,' . $now . ' FROM sources');
 			$this->pdo->exec('DELETE FROM topic_decisions');
 			$this->pdo->exec('DELETE FROM event_decisions');
 			$this->pdo->exec('DELETE FROM sources');
@@ -360,10 +410,31 @@ final class TopicDigestStore {
 		}
 	}
 
+	/**
+	 * Stamps the post-rebuild pipeline hash onto the jobs rebuildDigests() blanked. Deliberately not restricted to
+	 * state='pending': the worker can complete a job in the window between the two calls, and such a job would
+	 * otherwise keep an empty pipeline hash forever and never be reprocessed by the restart. An empty pipeline hash
+	 * is only ever produced by rebuildDigests(), so matching on it alone is exact.
+	 */
 	public function prepareRebuildJobs(string $pipelineHash): int {
-		$statement = $this->pdo->prepare("UPDATE jobs SET pipeline_hash=?,updated_at=? WHERE pipeline_hash='' AND state='pending'");
-		$statement->execute([$pipelineHash, time()]);
-		return $statement->rowCount();
+		$this->pdo->exec('BEGIN IMMEDIATE');
+		try {
+			$statement = $this->pdo->prepare("UPDATE jobs SET pipeline_hash=?,state='pending',attempts=0,"
+				. "available_at=0,lease_until=0,error='',updated_at=? WHERE pipeline_hash=''");
+			$statement->execute([$pipelineHash, time()]);
+			$count = $statement->rowCount();
+			// Reversing the read-marking of previously matched articles is the visible half of a restart, but it
+			// only happens once each of their jobs is processed. Without this they sit behind the whole archive
+			// backlog at the default archive priority, so a restart looks like it did nothing for days.
+			$this->pdo->exec('UPDATE jobs SET priority=1000 WHERE entry_id IN (SELECT entry_id FROM rebuild_restores)');
+			$this->pdo->commit();
+			return $count;
+		} catch (Throwable $e) {
+			if ($this->pdo->inTransaction()) {
+				$this->pdo->rollBack();
+			}
+			throw $e;
+		}
 	}
 
 	public function isPendingRebuildRestore(string $entryId): bool {
@@ -372,14 +443,32 @@ final class TopicDigestStore {
 
 	public function completeRebuildRestore(string $entryId): void {
 		$this->execute('DELETE FROM rebuild_restores WHERE entry_id=?', [$entryId]);
+		$this->execute('DELETE FROM rebuild_restore_topics WHERE entry_id=?', [$entryId]);
+	}
+
+	/**
+	 * Topic IDs this entry was matched to before a rebuild cleared "sources", so they can be forced back into
+	 * candidate selection instead of being silently dropped by the embedding-similarity shortlist.
+	 * @return list<int>
+	 */
+	public function previousTopicIdsForRebuild(string $entryId): array {
+		$statement = $this->pdo->prepare('SELECT topic_id FROM rebuild_restore_topics WHERE entry_id=?');
+		$statement->execute([$entryId]);
+		return array_map('intval', $statement->fetchAll(PDO::FETCH_COLUMN));
 	}
 
 	public function enqueue(FreshRSS_Entry $entry, int $categoryId, string $pipelineHash, int $priority = 100,
 		int $grace = 0, bool $archive = false): bool {
 		$now = time();
-		$existing = $this->row('SELECT content_hash,pipeline_hash,state,is_archive FROM jobs WHERE entry_id=?', [$entry->id()]);
+		$existing = $this->row('SELECT content_hash,pipeline_hash,state,is_archive,guid FROM jobs WHERE entry_id=?', [$entry->id()]);
 		if ($existing !== null && hash_equals((string)$existing['content_hash'], $entry->hash())
 				&& hash_equals((string)$existing['pipeline_hash'], $pipelineHash) && $existing['state'] !== 'failed') {
+			if ((string)($existing['guid'] ?? '') === '' && $entry->guid() !== '') {
+				// Rows queued before the guid column existed still carry '', which disables the GUID-based recovery
+				// of a stale entry id entirely — on exactly the old rows most likely to need it. Every re-queue
+				// (including a backfill rescan) takes this early-return branch, so backfill it here or never.
+				$this->execute('UPDATE jobs SET guid=? WHERE entry_id=?', [$entry->guid(), $entry->id()]);
+			}
 			if (!$archive && (bool)$existing['is_archive']) {
 				$this->execute('UPDATE jobs SET is_archive=0,priority=MAX(priority,?),available_at=MIN(available_at,?),updated_at=? '
 					. 'WHERE entry_id=?', [$priority, $now + max(0, min(300, $grace)), $now, $entry->id()]);
@@ -388,14 +477,14 @@ final class TopicDigestStore {
 		}
 		$statement = $this->pdo->prepare(<<<'SQL'
 			INSERT INTO jobs(entry_id,feed_id,category_id,title,author,link,published_at,content_hash,pipeline_hash,
-				rss_text,is_archive,priority,state,attempts,available_at,lease_until,error,created_at,updated_at)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'pending',0,?,0,'',?,?)
+				rss_text,is_archive,priority,state,attempts,available_at,lease_until,error,guid,created_at,updated_at)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'pending',0,?,0,'',?,?,?)
 			ON CONFLICT(entry_id) DO UPDATE SET feed_id=excluded.feed_id,category_id=excluded.category_id,
 				title=excluded.title,author=excluded.author,link=excluded.link,published_at=excluded.published_at,
 				content_hash=excluded.content_hash,pipeline_hash=excluded.pipeline_hash,rss_text=excluded.rss_text,
 				is_archive=excluded.is_archive,
 				priority=MAX(jobs.priority,excluded.priority),state='pending',attempts=0,available_at=excluded.available_at,
-				lease_until=0,error='',created_at=excluded.created_at,updated_at=excluded.updated_at
+				lease_until=0,error='',guid=excluded.guid,created_at=excluded.created_at,updated_at=excluded.updated_at
 			SQL);
 		$statement->execute([
 			$entry->id(), $entry->feedId(), $categoryId,
@@ -404,8 +493,24 @@ final class TopicDigestStore {
 			mb_substr(htmlspecialchars_decode($entry->link(raw: true), ENT_QUOTES), 0, 4096),
 			$entry->date(true), $entry->hash(), $pipelineHash, mb_strcut($entry->content(false), 0, 100000, 'UTF-8'),
 			$archive ? 1 : 0,
-			$priority, $now + max(0, min(300, $grace)), $now, $now,
+			$priority, $now + max(0, min(300, $grace)), $entry->guid(), $now, $now,
 		]);
+		return true;
+	}
+
+	/**
+	 * Re-keys a job to the entry's current, correct id, after resolving it via GUID because the id originally
+	 * captured (before FreshRSS's commit-time id renumbering) no longer matches any row. Returns false, changing
+	 * nothing, if a job already exists under the new id (e.g. a race with a fresh enqueue of the same article).
+	 */
+	public function rekeyJob(string $oldEntryId, string $newEntryId): bool {
+		if ($oldEntryId === $newEntryId) {
+			return true;
+		}
+		if ($this->row('SELECT 1 FROM jobs WHERE entry_id=?', [$newEntryId]) !== null) {
+			return false;
+		}
+		$this->execute('UPDATE jobs SET entry_id=? WHERE entry_id=?', [$newEntryId, $oldEntryId]);
 		return true;
 	}
 
@@ -660,7 +765,8 @@ final class TopicDigestStore {
 			[$topicId, $entryId, '', time()]);
 		$this->execute('DELETE FROM sources WHERE topic_id=? AND entry_id=?', [$topicId, $entryId]);
 		$this->removeEmptyEvent((int)$source['event_id']);
-		$this->createSuggestion($topicId, 'Exclude items like: ' . (string)$source['title']);
+		$this->createSuggestion($topicId, 'Exclude items like: ' . (string)$source['title'],
+			(string)$source['title'], (string)$source['link']);
 		return [$entryId];
 	}
 
@@ -673,12 +779,17 @@ final class TopicDigestStore {
 		$statement = $this->pdo->prepare('SELECT entry_id FROM sources WHERE event_id=?');
 		$statement->execute([$eventId]);
 		$ids = array_map('strval', $statement->fetchAll(PDO::FETCH_COLUMN));
+		// Captured before the sources are deleted below, so the suggestion can still show which article it came
+		// from. An event has several; the newest is the most recognisable one to show alongside the suggestion.
+		$representative = $this->row('SELECT title,link FROM sources WHERE event_id=? ORDER BY published_at DESC LIMIT 1',
+			[$eventId]);
 		$this->execute('INSERT OR IGNORE INTO rejections(topic_id,entry_id,fingerprint,title,explanation,embedding,occurred_at,created_at) '
 			. 'VALUES(?,?,?,?,?,?,?,?)', [$topicId, '', $event['fingerprint'], $event['title'], $event['explanation'],
 				$event['embedding'], $event['occurred_at'], time()]);
 		$this->execute('DELETE FROM sources WHERE event_id=?', [$eventId]);
 		$this->execute('DELETE FROM events WHERE id=?', [$eventId]);
-		$this->createSuggestion($topicId, 'Exclude events like: ' . (string)$event['title']);
+		$this->createSuggestion($topicId, 'Exclude events like: ' . (string)$event['title'],
+			(string)($representative['title'] ?? ''), (string)($representative['link'] ?? ''));
 		return $ids;
 	}
 
@@ -688,9 +799,10 @@ final class TopicDigestStore {
 		}
 	}
 
-	private function createSuggestion(int $topicId, string $text): void {
-		$this->execute("INSERT INTO suggestions(topic_id,text,state,created_at) VALUES(?,?,'pending',?)",
-			[$topicId, mb_substr($text, 0, 1000), time()]);
+	private function createSuggestion(int $topicId, string $text, string $sourceTitle = '', string $sourceLink = ''): void {
+		$this->execute("INSERT INTO suggestions(topic_id,text,source_title,source_link,state,created_at) "
+			. "VALUES(?,?,?,?,'pending',?)",
+			[$topicId, mb_substr($text, 0, 1000), mb_substr($sourceTitle, 0, 1000), mb_substr($sourceLink, 0, 4096), time()]);
 	}
 
 	/** @return list<array<string,mixed>> */
@@ -700,18 +812,28 @@ final class TopicDigestStore {
 		return $statement->fetchAll();
 	}
 
-	public function resolveSuggestion(int $topicId, int $id, bool $approve): void {
+	/**
+	 * @param string|null $editedText Replaces the suggested wording when approving. A suggestion is generated from
+	 *     one article's title, which is usually too specific to use verbatim as an exclusion rule, so the user gets
+	 *     to reword it before it is added. Ignored when dismissing.
+	 */
+	public function resolveSuggestion(int $topicId, int $id, bool $approve, ?string $editedText = null): void {
 		$suggestion = $this->row("SELECT * FROM suggestions WHERE id=? AND topic_id=? AND state='pending'", [$id, $topicId]);
 		if ($suggestion === null) {
 			throw new InvalidArgumentException('Unknown exclusion suggestion.');
 		}
 		if ($approve) {
+			$text = trim($editedText ?? (string)$suggestion['text']);
+			if ($text === '') {
+				throw new InvalidArgumentException('An approved exclusion cannot be empty.');
+			}
 			$topic = $this->topic($topicId);
 			if ($topic === null) {
 				throw new InvalidArgumentException('Unknown topic.');
 			}
-			$topic['exclusions'][] = (string)$suggestion['text'];
+			$topic['exclusions'][] = $text;
 			$this->saveTopic($topic, $topicId);
+			$this->execute('UPDATE suggestions SET text=? WHERE id=?', [mb_substr($text, 0, 1000), $id]);
 		}
 		$this->execute("UPDATE suggestions SET state=? WHERE id=?", [$approve ? 'approved' : 'dismissed', $id]);
 	}
@@ -742,6 +864,16 @@ final class TopicDigestStore {
 		return $this->row("SELECT 1 FROM overrides WHERE entry_id=? AND kind='manual_unread'", [$entryId]) !== null;
 	}
 
+	/** Whether this entry is known (live-observed or re-derived) to have been auto-read by a FreshRSS filter. */
+	public function isFilterRead(string $entryId): bool {
+		return $this->row('SELECT 1 FROM filter_read_entries WHERE entry_id=?', [$entryId]) !== null;
+	}
+
+	public function markFilterRead(string $entryId): void {
+		$this->execute('INSERT OR IGNORE INTO filter_read_entries(entry_id, created_at) VALUES (?, ?)',
+			[$entryId, time()]);
+	}
+
 	/** @param array<string,mixed> $job */
 	public function completeCurrent(array $job, string $state = 'done', string $error = ''): bool {
 		if (!$this->isCurrentJob($job)) {
@@ -749,6 +881,46 @@ final class TopicDigestStore {
 		}
 		$this->execute('UPDATE jobs SET state=?,lease_until=0,error=?,updated_at=? WHERE entry_id=?',
 			[$state, mb_substr($error, 0, 1000), time(), $job['entry_id']]);
+		return true;
+	}
+
+	/**
+	 * Deletes a claimed pre-GUID queue artefact instead of recording it as a processed article. The transaction
+	 * keeps the deletion and its aggregate status counter in step even if the process is interrupted.
+	 * @param array<string,mixed> $job
+	 */
+	public function discardStaleCurrent(array $job): bool {
+		$this->pdo->exec('BEGIN IMMEDIATE');
+		try {
+			if (!$this->isCurrentJob($job)) {
+				$this->pdo->commit();
+				return false;
+			}
+			$statement = $this->pdo->prepare('DELETE FROM jobs WHERE entry_id=?');
+			$statement->execute([$job['entry_id']]);
+			$discarded = $statement->rowCount() === 1;
+			if ($discarded) {
+				$this->setMeta('stale_jobs_discarded', (string)($this->staleJobsDiscarded() + 1));
+			}
+			$this->pdo->commit();
+			return $discarded;
+		} catch (Throwable $e) {
+			$this->pdo->rollBack();
+			throw $e;
+		}
+	}
+
+	/**
+	 * Hands a claimed job back to the queue without consuming an attempt, for when it turned out not to be ours to
+	 * finish (e.g. the pipeline moved on under us) rather than having failed.
+	 * @param array<string,mixed> $job
+	 */
+	public function releaseCurrent(array $job): bool {
+		if (!$this->isCurrentJob($job)) {
+			return false;
+		}
+		$this->execute("UPDATE jobs SET state='pending',lease_until=0,updated_at=? WHERE entry_id=?",
+			[time(), $job['entry_id']]);
 		return true;
 	}
 
@@ -765,14 +937,108 @@ final class TopicDigestStore {
 		return true;
 	}
 
+	/** Whether this job has used up its retries and will not be attempted again without an explicit Retry. */
+	public function hasExhaustedRetries(string $entryId): bool {
+		return $this->row("SELECT 1 FROM jobs WHERE entry_id=? AND state='failed'", [$entryId]) !== null;
+	}
+
+	/**
+	 * Re-queues every skipped article for a fresh decision.
+	 *
+	 * An archive rescan cannot do this: it only reaches articles FreshRSS still lists, so a skipped row is only
+	 * revisited if its id still matches a live entry. This re-queues them directly instead. Skips that are still
+	 * correct simply re-derive themselves — they are decided by rule, with no Ollama call — so the cost of
+	 * re-examining one that has not changed is negligible.
+	 */
+	/**
+	 * Queue rows that are bookkeeping residue rather than articles: queued before GUIDs were recorded, and keyed
+	 * by an id FreshRSS renumbered when it committed the entry, so nothing can resolve them back to an article.
+	 *
+	 * Every insert has recorded the entry's GUID since the column was added, and enqueue() backfills it on the
+	 * early-return path taken by a re-queue, so once an archive scan has completed a row still carrying '' is one
+	 * whose id matches no live entry. That makes them identifiable in SQL alone, without an entry lookup each.
+	 *
+	 * Counts only queued rows. A *skipped* row with no GUID is not necessarily residue — a pre-GUID row for a real
+	 * article that was skipped for a real reason ("Marked read by a FreshRSS filter", say) looks identical — so
+	 * those are matched by their recorded reason instead, in discardSkippedStaleRows().
+	 */
+	public function stalePendingJobCount(): int {
+		$row = $this->row("SELECT COUNT(*) AS count FROM jobs WHERE guid='' AND state IN ('pending','processing')");
+		return (int)($row['count'] ?? 0);
+	}
+
+	/**
+	 * Deletes the unresolvable pending rows, so the worker stops spending a claim, an entry lookup and a permanent
+	 * skip record on each one. Not done automatically: a row queued before the GUID column existed whose article
+	 * is still live is indistinguishable from residue until an archive scan has re-queued it and backfilled the
+	 * GUID, and deleting those would drop real work. The article itself is never lost either way — the archive
+	 * scan queues it again under its current id.
+	 */
+	public function pruneStalePendingJobs(): int {
+		$statement = $this->pdo->prepare("DELETE FROM jobs WHERE guid='' AND state IN ('pending','processing')");
+		$statement->execute();
+		$count = $statement->rowCount();
+		if ($count > 0) {
+			$this->setMeta('stale_jobs_discarded', (string)($this->staleJobsDiscarded() + $count));
+		}
+		return $count;
+	}
+
+	/** How many queue rows have been discarded as bookkeeping residue, in total. */
+	public function staleJobsDiscarded(): int {
+		return (int)($this->getMeta('stale_jobs_discarded') ?? 0);
+	}
+
+	/**
+	 * Drops already-skipped residue rows, folding their number into one running total instead of leaving each one
+	 * counted as an article that was processed and skipped. They are not articles, so reporting hundreds of them
+	 * under "Articles processed" — and filling the skip breakdown with them — describes work that never happened.
+	 *
+	 * Covers the two labels they were recorded under before this was split out, including the blank one left by
+	 * the "Reset logs" bug: matching on the current text alone would leave exactly the same rows behind under an
+	 * unaccountable "(no reason recorded)" tally.
+	 */
+	private function discardSkippedStaleRows(): void {
+		$reasons = [self::STALE_JOB_REASON, 'Entry no longer exists.', ''];
+		$placeholders = implode(',', array_fill(0, count($reasons), '?'));
+		$statement = $this->pdo->prepare(
+			"DELETE FROM jobs WHERE state='skipped' AND guid='' AND error IN ({$placeholders})");
+		$statement->execute($reasons);
+		$count = $statement->rowCount();
+		$this->discardedSkipsOnOpen = $count;
+		if ($count > 0) {
+			$this->setMeta('stale_jobs_discarded', (string)($this->staleJobsDiscarded() + $count));
+		}
+	}
+
+	/**
+	 * How many already-recorded residue rows this store dropped when it was opened. Reported by the prune command
+	 * so the retroactive cleanup is something you can see happen rather than a number that silently changed.
+	 */
+	public function discardedSkipsOnOpen(): int {
+		return $this->discardedSkipsOnOpen;
+	}
+
+	public function retrySkipped(): int {
+		$statement = $this->pdo->prepare("UPDATE jobs SET state='pending',attempts=0,available_at=0,lease_until=0,"
+			. "error='',updated_at=? WHERE state='skipped'");
+		$statement->execute([time()]);
+		return $statement->rowCount();
+	}
+
 	public function retryFailed(): int {
 		$statement = $this->pdo->prepare("UPDATE jobs SET state='pending',attempts=0,available_at=0,error='',updated_at=? WHERE state='failed'");
 		$statement->execute([time()]);
 		return $statement->rowCount();
 	}
 
+	/**
+	 * Clears recorded error text. A skipped job's "error" is not an error but the recorded reason it was skipped,
+	 * which is the only explanation of that outcome anywhere; wiping it turned settled results into an
+	 * unaccountable "(no reason recorded)" tally, so those are left alone.
+	 */
 	public function clearErrors(): int {
-		$statement = $this->pdo->prepare("UPDATE jobs SET error='' WHERE error<>''");
+		$statement = $this->pdo->prepare("UPDATE jobs SET error='' WHERE error<>'' AND state<>'skipped'");
 		$statement->execute();
 		return $statement->rowCount();
 	}
@@ -784,6 +1050,12 @@ final class TopicDigestStore {
 	}
 
 	public function ensureClassifierRevision(string $revision): bool {
+		// Called from init() on every single request, so check before taking a write lock: BEGIN IMMEDIATE here
+		// unconditionally meant every page load contended with the worker for the write lock (the same failure
+		// mode that made migrate() crash processes with "database is locked").
+		if ($this->getMeta('classifier_revision') === $revision) {
+			return false;
+		}
 		$this->pdo->exec('BEGIN IMMEDIATE');
 		try {
 			if ($this->getMeta('classifier_revision') === $revision) {
@@ -821,6 +1093,28 @@ final class TopicDigestStore {
 
 	public function isPaused(): bool {
 		return $this->getMeta('processing_paused') === '1';
+	}
+
+	/** Unix timestamp until which the cloud Ollama profile should be skipped in favour of the local one, or 0. */
+	public function cloudUnavailableUntil(): int {
+		return (int)($this->getMeta('cloud_unavailable_until') ?? 0);
+	}
+
+	public function markCloudUnavailable(int $untilTimestamp): void {
+		$this->setMeta('cloud_unavailable_until', (string)$untilTimestamp);
+	}
+
+	/**
+	 * Tracks the profile the user last had *configured*, so changing it invalidates embeddings computed under the
+	 * previous one. Deliberately not the effective profile: the automatic cloud->local fallback flips by itself
+	 * every cooldown, and invalidating on those flips just recomputed every embedding over and over.
+	 */
+	public function lastOllamaProfile(): ?string {
+		return $this->getMeta('ollama_profile');
+	}
+
+	public function setLastOllamaProfile(string $profile): void {
+		$this->setMeta('ollama_profile', $profile);
 	}
 
 	public function setPaused(bool $paused): void {
@@ -863,6 +1157,11 @@ final class TopicDigestStore {
 		$result = $counts;
 		$result['queued'] = $counts['pending'] + $counts['processing'];
 		$result['processed'] = $counts['done'] + $counts['skipped'];
+		// A job that errored but has attempts left goes back to 'pending', so it is indistinguishable from
+		// untouched queue work in the counts above. Surfaced separately: "failed" only ever means a job that has
+		// exhausted its retries, and without this an article erroring over and over looks like ordinary progress.
+		$result['retrying'] = (int)$this->pdo->query(
+			"SELECT COUNT(*) FROM jobs WHERE state='pending' AND error<>''")->fetchColumn();
 		$result['topics'] = (int)$this->pdo->query('SELECT COUNT(*) FROM topics')->fetchColumn();
 		$result['events'] = (int)$this->pdo->query('SELECT COUNT(*) FROM events')->fetchColumn();
 		$result['sources'] = (int)$this->pdo->query('SELECT COUNT(*) FROM sources')->fetchColumn();
@@ -877,12 +1176,38 @@ final class TopicDigestStore {
 			? round(($result['active_processed_articles'] * 3600) / $result['active_processing_seconds'], 1) : 0.0;
 		$result['backfill_active'] = $this->backfill()['active'] ? 1 : 0;
 		$result['paused'] = $this->isPaused() ? 1 : 0;
+		// Deliberately outside "processed": these rows were never articles, so counting each one as an article
+		// that was processed and skipped described work that never happened. One running total says the same
+		// thing honestly, and without burying the real skip reasons under hundreds of residue rows.
+		$result['stale_discarded'] = $this->staleJobsDiscarded();
 		return $result;
+	}
+
+	/**
+	 * Why the intentionally-skipped articles were skipped, most common first.
+	 *
+	 * Skips are deliberately kept out of recentErrors(), and are counted with completed work in "processed", so
+	 * without this the difference between "classified 40,000 articles" and "walked past 40,000 articles" is
+	 * invisible in the interface and only recoverable by querying this database directly.
+	 *
+	 * @return list<array{reason:string,count:int}>
+	 */
+	public function skipReasons(): array {
+		$statement = $this->pdo->query("SELECT error AS reason,COUNT(*) AS count FROM jobs WHERE state='skipped' "
+			. 'GROUP BY error ORDER BY COUNT(*) DESC, error LIMIT 20');
+		return array_map(static fn(array $row): array => [
+			'reason' => (string)$row['reason'],
+			'count' => (int)$row['count'],
+		], $statement === false ? [] : $statement->fetchAll());
 	}
 
 	/** @return list<array<string,mixed>> */
 	public function recentErrors(): array {
-		$statement = $this->pdo->query("SELECT entry_id,title,error,attempts,updated_at FROM jobs WHERE error<>'' ORDER BY updated_at DESC LIMIT 20");
+		// 'skipped' jobs (entry deleted, protected, filter-read, no eligible topic, ...) are intentional,
+		// expected outcomes, not failures, so they are excluded to keep this list to things worth attention.
+		$statement = $this->pdo->query(
+			"SELECT entry_id,title,error,state,attempts,updated_at FROM jobs WHERE error<>'' AND state<>'skipped' "
+			. 'ORDER BY updated_at DESC LIMIT 20');
 		return $statement === false ? [] : $statement->fetchAll();
 	}
 

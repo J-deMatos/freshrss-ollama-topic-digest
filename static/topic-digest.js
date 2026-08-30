@@ -115,6 +115,15 @@
 		};
 		topicType?.addEventListener('change', updateVerification);
 		updateVerification();
+		const profileRadios = document.querySelectorAll('[data-ollama-profile-radio]');
+		const updateProfile = () => {
+			const selected = document.querySelector('[data-ollama-profile-radio]:checked')?.value;
+			for (const fieldset of document.querySelectorAll('[data-ollama-profile-fields]')) {
+				fieldset.hidden = fieldset.dataset.ollamaProfileFields !== selected;
+			}
+		};
+		for (const radio of profileRadios) radio.addEventListener('change', updateProfile);
+		updateProfile();
 	};
 	document.addEventListener('freshrss:globalContextLoaded', configureCategoryLink, {once: true});
 	if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initialise, {once: true});

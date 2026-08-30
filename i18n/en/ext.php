@@ -4,10 +4,23 @@ return [
 		'title' => 'Topic Digest',
 		'intro' => 'Organise matching articles as living digests, high-priority feeds, or automatic mark-read rules.',
 		'ollama' => 'Ollama settings',
+		'ollama_profile' => 'Active profile',
+		'ollama_profile_local' => 'Local',
+		'ollama_profile_cloud' => 'Ollama Cloud',
+		'ollama_profile_help' => 'Keep separate URLs and models for local and cloud Ollama, and switch between them '
+			. 'without retyping either. Only the active profile is used; the other stays saved for next time. When '
+			. 'Ollama Cloud is active and it rejects a request for account/plan reasons (e.g. a usage limit), '
+			. 'processing automatically falls back to the local profile for a while, then tries the cloud again.',
+		'cloud_fallback_active' => 'Ollama Cloud is currently unavailable (account/plan limit); automatically using '
+			. 'the local profile until at least %s.',
 		'ollama_url' => 'Ollama URL',
 		'summary_model' => 'Summary model',
 		'judge_model' => 'Decision model',
 		'embedding_model' => 'Embedding model',
+		'structuring_model' => 'Structuring model (optional)',
+		'structuring_model_help' => 'Runs on the local profile\'s URL to re-extract a JSON reply when a primary '
+			. 'endpoint (e.g. Ollama Cloud, which does not support the JSON schema constraint) returns unstructured '
+			. 'text instead. Leave blank to use the local profile\'s summary model.',
 		'timeout' => 'Timeout (seconds)',
 		'scraping' => 'Fetch article pages when RSS content is incomplete',
 		'display_settings' => 'Display settings',
@@ -65,10 +78,19 @@ return [
 		'pause' => 'Pause',
 		'resume' => 'Resume',
 		'rescan' => 'Rescan archive',
+		'rescan_help' => 'Re-queues every archived article once, for all topics at once. Existing matches, '
+			. 'summaries and decisions are kept and reused, so this is much cheaper than a rebuild.',
+		'retry_skipped' => 'Re-examine skipped articles',
+		'retry_skipped_help' => 'Re-queues articles that were skipped. A rescan cannot reach these, because it '
+			. 'only revisits articles FreshRSS still lists. Skips that are still correct cost almost nothing to '
+			. 're-derive; articles that no longer exist stay skipped.',
 		'preview' => 'Test recent articles',
 		'delete' => 'Delete',
 		'restore_delete' => 'Restore all and delete',
 		'suggested_exclusion' => 'Suggested exclusion',
+		'suggested_exclusion_help' => 'Edit the wording before approving. It is suggested from one article\'s title, '
+			. 'which is usually too specific to exclude similar articles on its own.',
+		'suggestion_from_article' => 'Restored article',
 		'approve' => 'Approve',
 		'dismiss' => 'Dismiss',
 		'status' => 'Status',
@@ -77,13 +99,22 @@ return [
 		'queued' => 'In queue',
 		'processing' => 'Processing',
 		'processed' => 'Articles processed',
-		'failed' => 'Failed',
+		'done' => '— of which classified',
+		'skipped' => '— of which skipped',
+		'retrying' => 'Errored, awaiting retry',
+		'failed' => 'Failed permanently',
+		'stale_discarded' => 'Stale queue rows discarded',
+		'skip_reasons' => 'Why articles were skipped',
+		'skip_reasons_help' => 'Skipped articles count towards "Articles processed" but were never sent to Ollama. '
+			. 'These are expected outcomes, not failures.',
+		'skip_reason_unrecorded' => '(no reason recorded)',
 		'backfill_active' => 'Archive scan active',
 		'stats_summary' => 'Digest: %d queued · %d processed',
 		'average_speed' => 'Average processing speed',
 		'articles_per_hour' => '%s articles/hour',
 		'estimated_time' => 'Estimated processing time',
 		'estimated_duration' => 'About %s remaining',
+		'estimated_duration_backfilling' => 'About %s for the current queue (archive scan still running)',
 		'estimate_calculating' => 'Calculating…',
 		'estimate_complete' => 'Complete',
 		'estimate_paused' => 'Paused',
@@ -95,5 +126,13 @@ return [
 		'retry' => 'Retry failures',
 		'reset_log' => 'Reset logs',
 		'recent_errors' => 'Recent errors',
+		'attempts' => 'Attempts',
+		'error_state_pending' => 'Retrying',
+		'error_state_processing' => 'Processing',
+		'error_state_failed' => 'Failed permanently',
+		'error_state_skipped' => 'Skipped',
+		'view_complete_log' => 'View complete log',
+		'complete_log_empty' => 'The worker log is empty.',
+		'complete_log_truncated' => 'Showing the last %d KB of the log file.',
 	],
 ];

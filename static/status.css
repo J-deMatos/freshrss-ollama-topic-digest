@@ -18,7 +18,7 @@
 	min-width: 18rem;
 	padding: 0.75rem;
 	position: absolute;
-	right: 0;
+	left: 0;
 	top: 100%;
 	z-index: 1000;
 }

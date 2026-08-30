@@ -5,6 +5,8 @@ declare(strict_types=1);
 final class TopicDigestProcessor {
 	private const TOPIC_DECISION_REVISION = 'topic-batch-v2';
 	private const EVENT_DECISION_REVISION = 'event-batch-v1';
+	/** How long to skip Ollama Cloud after it rejects a request for account/plan reasons (HTTP 402/429). */
+	private const CLOUD_COOLDOWN_SECONDS = 1200;
 	private TopicDigestStore $store;
 	/** @var TopicDigestConfig */
 	private array $config;
@@ -13,7 +15,18 @@ final class TopicDigestProcessor {
 	public function __construct(private readonly TopicDigestExtension $extension) {
 		$this->store = $extension->store();
 		$this->config = $extension->configuration();
-		$this->ollama = new TopicDigestOllama((string)$this->config['ollama_url'], (int)$this->config['timeout']);
+		$this->ollama = new TopicDigestOllama((string)$this->config['ollama_url'], (int)$this->config['timeout'],
+			structuringUrl: (string)$extension->ollamaProfiles()['local']['ollama_url'],
+			structuringModel: (string)$this->config['structuring_model']);
+		// Keyed on the *stored* profile, never the effective one: the automatic cloud->local fallback flips on its
+		// own every cooldown, and invalidating every embedding on each flip meant they were permanently being
+		// recomputed rather than used. A temporary fallback may therefore leave embeddings from two models in the
+		// cache; cosine() already scores mismatched dimensions as -1, so that only blurs candidate ranking.
+		$storedProfile = (string)$this->config['ollama_profile'];
+		if ($this->store->lastOllamaProfile() !== $storedProfile) {
+			$this->store->invalidateEmbeddings();
+			$this->store->setLastOllamaProfile($storedProfile);
+		}
 	}
 
 	/** @return array{processed:int,failed:int,backfill_scanned:int} */
@@ -29,13 +42,16 @@ final class TopicDigestProcessor {
 		$processed = 0;
 		$failed = 0;
 		$scanned = 0;
-		$status = $this->store->status();
-		if (!$this->store->isPaused() && $this->store->backfill()['active']
-				&& (int)$status['queued'] < max(20, $limit * 2)) {
-			$count = $this->extension->enqueueBackfillPage(20);
-			$scanned += $count;
-			if ($count === 0 && $this->store->backfill()['active']) {
-				throw new RuntimeException('Topic Digest archive scan did not advance.');
+		// Enqueue the whole remaining archive up front (not paced against the current queue depth) so
+		// "queued" reflects the true amount of outstanding work, making the processing-time estimate meaningful
+		// from the start instead of growing as backfill trickles more items in over time.
+		if (!$this->store->isPaused()) {
+			while ($this->store->backfill()['active']) {
+				$count = $this->extension->enqueueBackfillPage(100);
+				$scanned += $count;
+				if ($count === 0 && $this->store->backfill()['active']) {
+					throw new RuntimeException('Topic Digest archive scan did not advance.');
+				}
 			}
 		}
 		if ($this->store->isPaused()) {
@@ -60,13 +76,43 @@ final class TopicDigestProcessor {
 					}
 				}
 			} catch (Throwable $e) {
+				if ($e instanceof OllamaQuotaExceededException && (string)$this->config['ollama_profile'] === 'cloud') {
+					$this->store->markCloudUnavailable(time() + self::CLOUD_COOLDOWN_SECONDS);
+					Minz_Log::error('Topic Digest: Ollama Cloud usage limit reached, falling back to the local '
+						. 'profile for ' . self::CLOUD_COOLDOWN_SECONDS . ' seconds: ' . $e->getMessage());
+				}
 				if ($this->store->failCurrent($job, $e->getMessage())) {
 					$failed++;
 					Minz_Log::error('Topic Digest worker error: ' . $e->getMessage());
+					$this->releaseRebuildRestoreIfAbandoned($job);
 				}
 			}
 		}
 		return ['processed' => $processed, 'failed' => $failed, 'backfill_scanned' => $scanned];
+	}
+
+	/**
+	 * A job that has used up its retries never reaches finishRebuildForEntry(), so an article a restart marked for
+	 * restoration would stay read indefinitely with nothing left to un-read it. Treat exhaustion as "no longer
+	 * matches" for restore purposes; an explicit Retry re-queues the job and it can still match again afterwards.
+	 *
+	 * @param array<string,mixed> $job
+	 */
+	private function releaseRebuildRestoreIfAbandoned(array $job): void {
+		$entryId = (string)$job['entry_id'];
+		try {
+			if (!$this->store->isPendingRebuildRestore($entryId) || !$this->store->hasExhaustedRetries($entryId)) {
+				return;
+			}
+			$entry = FreshRSS_Factory::createEntryDao()->searchById($entryId);
+			if ($entry === null) {
+				$this->store->completeRebuildRestore($entryId);
+				return;
+			}
+			$this->extension->finishRebuildForEntry($entry, false);
+		} catch (Throwable $e) {
+			Minz_Log::error('Topic Digest rebuild-restore cleanup error: ' . $e->getMessage());
+		}
 	}
 
 	/** @param array<string,mixed> $topic @return list<array{title:string,matches:bool,confidence:float,reason:string}> */
@@ -95,8 +141,21 @@ final class TopicDigestProcessor {
 	private function process(array $job): bool {
 		$entry = FreshRSS_Factory::createEntryDao()->searchById((string)$job['entry_id']);
 		if ($entry === null) {
+			$entry = $this->recoverEntryByGuid($job);
+			if ($entry !== null) {
+				$job['entry_id'] = $entry->id();
+			}
+		}
+		if ($entry === null) {
 			$this->store->completeRebuildRestore((string)$job['entry_id']);
-			return $this->store->completeCurrent($job, 'skipped', 'Entry no longer exists.');
+			// Without a GUID there is no way to tell a genuinely deleted article from a row still keyed by the
+			// provisional id FreshRSS assigned before renumbering it at commit time. Only rows queued before GUIDs
+			// were recorded are in that state, and the article itself, if it still exists, is queued again under
+			// its current id by the archive scan, so say so rather than reporting a deletion that may not have
+			// happened.
+			return (string)($job['guid'] ?? '') === ''
+				? $this->store->discardStaleCurrent($job)
+				: $this->store->completeCurrent($job, 'skipped', 'Entry no longer exists.');
 		}
 		if ($this->extension->isSyntheticFeed($entry->feedId())) {
 			return $this->store->completeCurrent($job, 'skipped', 'Synthetic digest entry.');
@@ -104,8 +163,13 @@ final class TopicDigestProcessor {
 		if (!hash_equals((string)$job['content_hash'], $entry->hash())
 				|| !hash_equals((string)$job['pipeline_hash'], $this->extension->pipelineHash())) {
 			$feed = $entry->feed();
-			$this->store->enqueue($entry, $feed?->categoryId() ?? 0, $this->extension->pipelineHash(),
-				archive: (bool)($job['is_archive'] ?? false));
+			// enqueue() returns false without touching the row when it is already current (another process got
+			// there first). The row is then still 'processing' with our lease, so release it explicitly instead of
+			// leaving it to expire — each expiry costs an attempt and four of them fail the job outright.
+			if (!$this->store->enqueue($entry, $feed?->categoryId() ?? 0, $this->extension->pipelineHash(),
+					archive: (bool)($job['is_archive'] ?? false))) {
+				$this->store->releaseCurrent($job);
+			}
 			return false;
 		}
 		foreach ($this->store->detachChangedSources($entry->id(), $entry->hash()) as $topicId) {
@@ -124,6 +188,10 @@ final class TopicDigestProcessor {
 		if ($entry->isFavorite() || $this->store->isProtected($entry->id())) {
 			$this->extension->finishRebuildForEntry($entry, false);
 			return $this->store->completeCurrent($job, 'skipped', 'Article is protected by the user.');
+		}
+		if ($this->extension->isFilterReadEntry($entry)) {
+			$this->extension->finishRebuildForEntry($entry, false);
+			return $this->store->completeCurrent($job, 'skipped', 'Marked read by a FreshRSS filter.');
 		}
 		if (!$this->hasEligibleTopic($job)) {
 			$this->extension->finishRebuildForEntry($entry, false);
@@ -246,6 +314,30 @@ final class TopicDigestProcessor {
 		return $this->store->completeCurrent($job);
 	}
 
+	/**
+	 * FreshRSS assigns an entry's final id only when committing new entries, after the id captured at
+	 * enqueue time (EntryBeforeInsert/EntryBeforeAdd). So a stored entry_id can be stale from the start,
+	 * especially for archive/backfill jobs and entries queued around the same time as many others. Before
+	 * concluding the article is gone, try to resolve its current id via its (stable) GUID instead.
+	 * @param array<string,mixed> $job
+	 */
+	private function recoverEntryByGuid(array $job): ?FreshRSS_Entry {
+		$guid = (string)($job['guid'] ?? '');
+		if ($guid === '') {
+			return null;
+		}
+		$entryDao = FreshRSS_Factory::createEntryDao();
+		$resolvedId = $entryDao->searchIdByGuid((int)$job['feed_id'], $guid);
+		if ($resolvedId === null || $resolvedId === (string)$job['entry_id']) {
+			return null;
+		}
+		$entry = $entryDao->searchById($resolvedId);
+		if ($entry === null || !$this->store->rekeyJob((string)$job['entry_id'], $resolvedId)) {
+			return null;
+		}
+		return $entry;
+	}
+
 	/** @param array<string,mixed> $job */
 	private function jobUsesCurrentPipeline(array $job): bool {
 		return $this->store->isCurrentJob($job)
@@ -255,20 +347,30 @@ final class TopicDigestProcessor {
 	/** @param array<string,mixed> $job @param list<float> $embedding @return list<array<string,mixed>> */
 	private function candidateTopics(array $job, array $embedding): array {
 		$candidates = [];
-		$memberships = array_fill_keys($this->store->topicIdsForSource((string)$job['entry_id']), true);
+		$entryId = (string)$job['entry_id'];
+		$memberships = array_fill_keys($this->store->topicIdsForSource($entryId), true);
+		// A rebuild clears "sources" up front, so topicIdsForSource() alone would miss every topic an article
+		// was previously matched to; this keeps those guaranteed candidates instead of leaving their fate to
+		// whichever topics happen to rank in the embedding-similarity shortlist below.
+		$previouslyMatched = array_fill_keys($this->store->previousTopicIdsForRebuild($entryId), true);
 		foreach ($this->store->topics(true) as $topic) {
 			if (!$this->topicAccepts($topic, $job)) {
 				continue;
 			}
 			$topicEmbedding = $this->topicEmbedding($topic);
+			$id = (int)$topic['id'];
 			$candidates[] = ['score' => self::cosine($embedding, $topicEmbedding), 'topic' => $topic,
-				'membership' => isset($memberships[(int)$topic['id']])];
+				'membership' => isset($memberships[$id]) || isset($previouslyMatched[$id])];
 		}
 		usort($candidates, static fn(array $left, array $right): int => $right['score'] <=> $left['score']);
 		$selected = array_slice($candidates, 0, 5);
+		// Tracked by topic id rather than by comparing whole candidate arrays: identity comparison of nested
+		// arrays is both needlessly expensive and silently wrong the moment two topics compare equal by value.
+		$selectedIds = array_fill_keys(array_map(static fn(array $c): int => (int)$c['topic']['id'], $selected), true);
 		foreach ($candidates as $candidate) {
-			if ($candidate['membership'] && !in_array($candidate, $selected, true)) {
+			if ($candidate['membership'] && !isset($selectedIds[(int)$candidate['topic']['id']])) {
 				$selected[] = $candidate;
+				$selectedIds[(int)$candidate['topic']['id']] = true;
 			}
 		}
 		return array_map(static fn(array $candidate): array => $candidate['topic'], $selected);

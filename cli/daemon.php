@@ -50,8 +50,12 @@ $startingRestartRevision = $extension->store()->workerRestartRevision();
 try {
 	do {
 		$result = ['processed' => 0, 'failed' => 0, 'backfill_scanned' => 0];
+		// One processor per batch, not per article: constructing it re-reads the whole configuration and the
+		// profile bookkeeping. Any configuration change alters the fingerprint below and reloads the daemon
+		// outright, so a processor never outlives the settings it was built from.
+		$processor = new TopicDigestProcessor($extension);
 		for ($index = 0; $index < $batch; $index++) {
-			$single = (new TopicDigestProcessor($extension))->run(1);
+			$single = $processor->run(1);
 			$result['processed'] += $single['processed'];
 			$result['failed'] += $single['failed'];
 			$result['backfill_scanned'] += $single['backfill_scanned'];
@@ -68,7 +72,11 @@ try {
 			}
 		}
 		$status = $extension->store()->status();
-		echo date(DATE_ATOM), ': processed ', $result['processed'], '; failed ', $result['failed'],
+		// "errors", not "failed": this counts failures in this batch including ones that will be retried, whereas
+		// the status page's "Failed" counts only jobs that have exhausted their retries. Reporting both under the
+		// same name made the two look like they contradicted each other.
+		echo date(DATE_ATOM), ': processed ', $result['processed'], '; errors ', $result['failed'],
+			'; awaiting retry ', $status['retrying'], '; failed permanently ', $status['failed'],
 			'; scanned ', $result['backfill_scanned'], '; queued ', $status['queued'], ".\n";
 		if ($reload || (int)$status['paused'] !== 0
 				|| ((int)$status['queued'] === 0 && (int)$status['backfill_active'] === 0)) {

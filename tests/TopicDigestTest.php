@@ -656,6 +656,81 @@ final class TopicDigestTest extends TestCase {
 		self::assertFalse($this->store->isRejected($topicId, '100'));
 	}
 
+	public function testFirstSourceOfAnEventIsRecordedAsItsPrimary(): void {
+		$topicId = $this->store->saveTopic(['name' => 'AI', 'description' => 'AI model releases',
+			'enabled' => true, 'all_feeds' => true, 'topic_type' => 'feed']);
+		$first = $this->store->addMatch($topicId, $this->job('100', 'Outlet A'), 'FeedA', 'Model X released',
+			1_700_000_000, 'Release', [1.0], null);
+		$second = $this->store->addMatch($topicId, $this->job('200', 'Outlet B'), 'FeedB', 'Model X released',
+			1_700_000_100, 'Also released', [1.0], $first['event_id']);
+		self::assertTrue($first['new_event']);
+		self::assertFalse($second['new_event']);
+		self::assertSame($first['event_id'], $second['event_id']);
+
+		$events = $this->store->events($topicId);
+		self::assertCount(1, $events);
+		self::assertSame('100', $events[0]['primary_entry_id']);
+		self::assertCount(2, $events[0]['sources']);
+	}
+
+	public function testRemovingTheEventPrimaryPromotesTheRemainingSource(): void {
+		$topicId = $this->store->saveTopic(['name' => 'AI', 'description' => 'AI model releases',
+			'enabled' => true, 'all_feeds' => true, 'topic_type' => 'feed']);
+		$first = $this->store->addMatch($topicId, $this->job('100', 'Outlet A'), 'FeedA', 'Model X released',
+			1_700_000_000, 'Release', [1.0], null);
+		$this->store->addMatch($topicId, $this->job('200', 'Outlet B'), 'FeedB', 'Model X released',
+			1_700_000_100, 'Also released', [1.0], $first['event_id']);
+
+		self::assertTrue($this->store->removeSourceMembership($topicId, '100'));
+		$events = $this->store->events($topicId);
+		self::assertCount(1, $events);
+		self::assertSame('200', $events[0]['primary_entry_id']);
+		self::assertCount(1, $events[0]['sources']);
+
+		self::assertTrue($this->store->removeSourceMembership($topicId, '200'));
+		self::assertSame([], $this->store->events($topicId));
+	}
+
+	public function testRemovingANonPrimarySourceLeavesThePrimaryUnchanged(): void {
+		$topicId = $this->store->saveTopic(['name' => 'AI', 'description' => 'AI model releases',
+			'enabled' => true, 'all_feeds' => true, 'topic_type' => 'feed']);
+		$first = $this->store->addMatch($topicId, $this->job('100', 'Outlet A'), 'FeedA', 'Model X released',
+			1_700_000_000, 'Release', [1.0], null);
+		$this->store->addMatch($topicId, $this->job('200', 'Outlet B'), 'FeedB', 'Model X released',
+			1_700_000_100, 'Also released', [1.0], $first['event_id']);
+
+		self::assertTrue($this->store->removeSourceMembership($topicId, '200'));
+		$events = $this->store->events($topicId);
+		self::assertCount(1, $events);
+		self::assertSame('100', $events[0]['primary_entry_id']);
+		self::assertCount(1, $events[0]['sources']);
+	}
+
+	public function testMatchedSourceEntryIdsListsEveryDistinctMatchedEntry(): void {
+		$topicId = $this->store->saveTopic(['name' => 'AI', 'description' => 'AI model releases',
+			'enabled' => true, 'all_feeds' => true]);
+		$otherTopicId = $this->store->saveTopic(['name' => 'Privacy', 'description' => 'Privacy news',
+			'enabled' => true, 'all_feeds' => true]);
+		self::assertSame([], $this->store->matchedSourceEntryIds());
+
+		$this->store->addMatch($topicId, $this->job('100', 'Model released'), 'FeedA', 'Model X released',
+			1_700_000_000, 'Release', [1.0], null);
+		$this->store->addMatch($otherTopicId, $this->job('200', 'Leak disclosed'), 'FeedB', 'Leak Y',
+			1_700_000_100, 'Leak', [1.0], null);
+		self::assertSame(['100', '200'], $this->store->matchedSourceEntryIds());
+	}
+
+	public function testHasMatchingSourceContentHashDetectsChangedOrUnknownEntries(): void {
+		$topicId = $this->store->saveTopic(['name' => 'AI', 'description' => 'AI model releases',
+			'enabled' => true, 'all_feeds' => true]);
+		$job = $this->job('100', 'Model released');
+		$this->store->addMatch($topicId, $job, 'FeedA', 'Model X released', 1_700_000_000, 'Release', [1.0], null);
+
+		self::assertTrue($this->store->hasMatchingSourceContentHash('100', $job['content_hash']));
+		self::assertFalse($this->store->hasMatchingSourceContentHash('100', hash('md5', 'Something else now')));
+		self::assertFalse($this->store->hasMatchingSourceContentHash('999', $job['content_hash']));
+	}
+
 	public function testOllamaDropsAdditionalStructuredFieldsInsteadOfLosingTheAnswer(): void {
 		// On an endpoint that cannot enforce the schema, refusing a complete answer over one surplus key only
 		// loses the article. The extra key is dropped so no caller ever sees an undeclared field.

@@ -571,13 +571,21 @@ final class TopicDigestExtension extends Minz_Extension {
 		return $topic['topic_type'] !== 'mark_read' || (bool)$topic['show_verification'];
 	}
 
-	/** @param array<string,mixed> $topic */
+	/**
+	 * Only the source that opened an event is materialised as its own entry; further sources joining the same
+	 * event are still recorded in "sources" (for "why matched"/Restore and the pinned overview's source list)
+	 * but do not get a further entry of their own — otherwise the same real-world story, covered by several
+	 * matched articles, showed up as that many separate unread entries in the high-priority feed.
+	 *
+	 * @param array<string,mixed> $topic
+	 */
 	private function synchroniseHighPriorityFeed(array $topic, int $feedId, bool $prune, int $seenAt): void {
 		$entryDao = FreshRSS_Factory::createEntryDao();
-		$sourceIds = [];
+		$primarySourceIds = [];
 		foreach ($this->store()->events((int)$topic['id']) as $event) {
-			foreach ($event['sources'] as $source) {
-				$sourceIds[] = (string)$source['entry_id'];
+			$primaryId = self::primarySourceEntryId($event);
+			if ($primaryId !== null) {
+				$primarySourceIds[] = $primaryId;
 			}
 		}
 		$existing = [];
@@ -586,10 +594,33 @@ final class TopicDigestExtension extends Minz_Extension {
 				$existing[$entry->guid()] = $entry;
 			}
 		}
-		foreach (array_values(array_unique($sourceIds)) as $sourceId) {
+		foreach (array_values(array_unique($primarySourceIds)) as $sourceId) {
 			$guid = $this->topicSourceGuid((int)$topic['id'], $sourceId);
 			$this->materialiseHighPriorityEntry($topic, $feedId, $sourceId, $seenAt, $existing[$guid] ?? null);
 		}
+	}
+
+	/**
+	 * The entry_id of the source that opened this event, i.e. the one materialised as its own entry in a
+	 * high-priority feed. Falls back to the earliest-added source for an event stored before primary_entry_id
+	 * existed, or when its recorded primary is no longer a member (see TopicDigestStore::removeEmptyEvent()).
+	 *
+	 * @param array<string,mixed> $event
+	 */
+	private static function primarySourceEntryId(array $event): ?string {
+		$primary = (string)($event['primary_entry_id'] ?? '');
+		/** @var list<array<string,mixed>> $sources */
+		$sources = $event['sources'];
+		foreach ($sources as $source) {
+			if ($primary !== '' && (string)$source['entry_id'] === $primary) {
+				return $primary;
+			}
+		}
+		if ($sources === []) {
+			return null;
+		}
+		usort($sources, static fn(array $left, array $right): int => $left['added_at'] <=> $right['added_at']);
+		return (string)$sources[0]['entry_id'];
 	}
 
 	/**
@@ -630,7 +661,13 @@ final class TopicDigestExtension extends Minz_Extension {
 		}
 	}
 
-	public function materialiseTopicSource(int $topicId, string $sourceEntryId, bool $markOverviewUnread): void {
+	/**
+	 * $isNewEvent also gates whether $sourceEntryId gets its own entry in the high-priority feed: only the
+	 * source that opens a new event does. A further source joining an already-materialised event is still
+	 * recorded in "sources" (surfaced via the pinned overview and "why matched"/Restore) but does not spawn a
+	 * second entry for what the reader would see as the same story.
+	 */
+	public function materialiseTopicSource(int $topicId, string $sourceEntryId, bool $isNewEvent): void {
 		$topic = $this->store()->topic($topicId);
 		if ($topic === null || $topic['topic_type'] !== 'feed') {
 			return;
@@ -641,8 +678,10 @@ final class TopicDigestExtension extends Minz_Extension {
 			return;
 		}
 		$seenAt = time();
-		$this->materialiseHighPriorityEntry($topic, $feedId, $sourceEntryId, $seenAt);
-		$overview = $this->synchroniseOverviewEntry($topic, $feedId, $markOverviewUnread, pinned: true, seenAt: $seenAt);
+		if ($isNewEvent) {
+			$this->materialiseHighPriorityEntry($topic, $feedId, $sourceEntryId, $seenAt);
+		}
+		$overview = $this->synchroniseOverviewEntry($topic, $feedId, $isNewEvent, pinned: true, seenAt: $seenAt);
 		$this->store()->attachSynthetic($topicId, $feedId, $overview->id());
 		FreshRSS_Factory::createFeedDao()->updateCachedValues($feedId);
 		FreshRSS_UserDAO::touch();

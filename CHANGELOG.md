@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.5.3 - 2026-08-31
+
+- Fix a high-priority topic materialising one unread entry per matched
+  *source article* instead of one per *event*, so a single real-world story
+  covered by several matched articles (near-duplicate republishes, the same
+  event reported by more than one feed) showed up as that many separate
+  entries. Only the source that opens an event is now materialised as its
+  own entry; further sources joining the same event are still recorded (and
+  listed, with their own "why matched", in the pinned overview) but no
+  longer spawn additional entries. If the materialised source stops
+  matching or its content changes away from the event, the next-earliest
+  remaining source is promoted in its place and the old entry is pruned on
+  the following sync. Existing installs backfill the new event/source
+  linkage from their current data on upgrade; a topic's next reconciliation,
+  restart, or rebuild then prunes the extra per-source entries this had
+  already created.
+- Add `cli/resync-high-priority-feeds.php` to apply the above to an existing
+  installation without waiting for a topic's next reconciliation, restart, or
+  rebuild — and without the Ollama cost of a full rebuild, since it only
+  re-synchronises each high-priority topic's feed from its already-classified
+  matches and events. Reports current vs. target entry counts by default and
+  only writes with `--apply`.
+- Add `cli/mark-matched-sources-read.php` for installations that accumulated
+  matched source articles that were never actually marked read in their
+  original feed, from gaps in that logic across earlier versions. Applies the
+  same read-marking rule the worker already uses for a fresh match — skipping
+  favourites, entries the user manually kept unread, entries a rebuild is
+  still deciding whether to restore, and entries whose content has changed
+  since they matched — to every currently matched source, once. Reports what
+  it would change by default and only writes with `--apply`.
+
 ## 0.5.2 - 2026-08-29
 
 - Require a non-empty article summary and event title in the structured schema

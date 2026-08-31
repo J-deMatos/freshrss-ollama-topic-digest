@@ -110,19 +110,65 @@ Each topic has one of two presentations:
 - **Low priority** groups matches as dated events in one living digest entry. A
   genuinely new event marks that entry unread; extra coverage does not.
 - **High priority** pins the same living event overview at the top, followed by
-  one normal unread FreshRSS entry for every matched source. The individual
-  entries retain the original title, author, article content, link, publication
-  date, tags, and enclosures and can be read or favourited normally.
+  one normal unread FreshRSS entry per matched *event*. The individual entries
+  retain the original title, author, article content, link, publication date,
+  tags, and enclosures and can be read or favourited normally.
 
 Both presentations live under the synthetic **Topic Digests** category and are
 excluded from the main stream, network refresh, archive scanning, and matching.
 Changing presentation replaces only extension-owned generated objects and
 preserves the topic rule and its source memberships.
 
+When several matched articles describe the same event — near-duplicate
+republishes, or the same story reported by more than one feed — only the
+source that first opened the event gets its own entry in a high-priority
+feed; the other sources still count toward the match and are listed, each
+with its own explanation, in the pinned overview, but do not add further
+entries for what would otherwise read as the same story shown twice. If that
+entry's source stops matching or is Restored, the next-earliest remaining
+source takes its place.
+
 A high-priority feed's generated articles are removed when their match goes
 away, including when a rebuild clears every match at once, so the sidebar's
 `[ number ]` of matched sources and the feed's unread count stay consistent.
 Favourited articles are kept, as everywhere else in this extension.
+
+An installation that already ran a high-priority topic before one entry per
+event became the rule keeps whichever extra per-source entries it had already
+created until that topic's feed is next resynchronised with pruning enabled —
+normally its next "Restart and rebuild" pass. To drop the extra entries
+without also re-deriving every classification decision (which "Restart and
+rebuild" does, at the cost of an Ollama call per previously matched article),
+run:
+
+```sh
+php /var/www/FreshRSS/extensions/xExtension-TopicDigest/cli/resync-high-priority-feeds.php \
+	--user alice          # reports current vs. target entry counts
+php /var/www/FreshRSS/extensions/xExtension-TopicDigest/cli/resync-high-priority-feeds.php \
+	--user alice --apply  # resyncs every high-priority topic to match
+```
+
+It only re-synchronises each topic's high-priority feed from its existing
+matches and events, making no Ollama calls and requeuing no jobs. Like the
+other maintenance commands, it refuses to run while the worker holds its
+lock.
+
+That resync only touches the generated Topic Digest entries; it never marks
+anything read or unread in the original feed. Marking a matched source's
+original article read there is a separate step that runs when the match is
+first made, and gaps in it across earlier versions can leave some already-
+matched articles unread in their original feed even though they are properly
+represented in the digest. To retroactively apply that same read-marking rule
+— skipping favourites, articles the user manually kept unread, and anything
+whose content has changed since it matched — to every currently matched
+source, once, run:
+
+```sh
+php /var/www/FreshRSS/extensions/xExtension-TopicDigest/cli/mark-matched-sources-read.php \
+	--user alice          # reports what would be marked read, and why anything is skipped
+php /var/www/FreshRSS/extensions/xExtension-TopicDigest/cli/mark-matched-sources-read.php \
+	--user alice --apply  # marks them read
+```
 
 **Mark read** topics store matches, explanations, events, and Restore decisions
 without creating a synthetic feed by default. A per-topic verification option

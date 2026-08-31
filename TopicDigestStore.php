@@ -6,7 +6,7 @@ final class TopicDigestStore {
 	// Bumped past the pre-existing hardcoded "6" (whose exact history is uncertain) so every installation is
 	// guaranteed to run the full (idempotent) migration body at least once more, picking up anything that may
 	// have been added to it without a matching version bump, before settling on this version going forward.
-	private const SCHEMA_VERSION = 11;
+	private const SCHEMA_VERSION = 12;
 	/** The reason recorded for a queue row that turned out to be bookkeeping residue rather than an article. */
 	public const STALE_JOB_REASON = 'Stale queue entry with no GUID to resolve it by.';
 	private PDO $pdo;
@@ -102,6 +102,7 @@ final class TopicDigestStore {
 				explanation TEXT NOT NULL,
 				embedding TEXT NOT NULL,
 				fingerprint TEXT NOT NULL,
+				primary_entry_id TEXT NOT NULL DEFAULT '',
 				created_at INTEGER NOT NULL,
 				updated_at INTEGER NOT NULL
 			);
@@ -224,6 +225,19 @@ final class TopicDigestStore {
 			if (!$this->hasColumn('suggestions', $column)) {
 				$this->pdo->exec("ALTER TABLE suggestions ADD COLUMN {$column} TEXT NOT NULL DEFAULT ''");
 			}
+		}
+		if (!$this->hasColumn('events', 'primary_entry_id')) {
+			$this->pdo->exec("ALTER TABLE events ADD COLUMN primary_entry_id TEXT NOT NULL DEFAULT ''");
+			// Backfill from existing data: the earliest-added source of each event is the closest available
+			// approximation of "the source that opened it" for events that predate this column. A high-priority
+			// feed's next prune (reconciliation, restart, or rebuild) then keeps only that source's entry and
+			// removes the other per-source entries the same event had accumulated one per matched article.
+			$this->pdo->exec(<<<'SQL'
+				UPDATE events SET primary_entry_id = (
+					SELECT entry_id FROM sources WHERE sources.event_id = events.id
+					ORDER BY added_at ASC, sources.rowid ASC LIMIT 1
+				)
+				SQL);
 		}
 		// Rows keyed by an id FreshRSS renumbered at commit time, queued before GUIDs were recorded and so with no
 		// way left to resolve them. They are bookkeeping artefacts rather than articles — the article itself is
@@ -646,7 +660,7 @@ final class TopicDigestStore {
 		try {
 			$this->execute('DELETE FROM sources WHERE entry_id=? AND content_hash<>?', [$entryId, $contentHash]);
 			foreach ($rows as $row) {
-				$this->removeEmptyEvent((int)$row['event_id']);
+				$this->removeEmptyEvent((int)$row['event_id'], $entryId);
 			}
 			$this->pdo->commit();
 		} catch (Throwable $e) {
@@ -681,13 +695,29 @@ final class TopicDigestStore {
 		return $this->row('SELECT * FROM sources WHERE topic_id=? AND entry_id=?', [$topicId, $entryId]);
 	}
 
+	/** Every entry currently recorded as a match by at least one topic, across every topic. @return list<string> */
+	public function matchedSourceEntryIds(): array {
+		$statement = $this->pdo->query('SELECT DISTINCT entry_id FROM sources ORDER BY entry_id');
+		return $statement === false ? [] : array_map('strval', $statement->fetchAll(PDO::FETCH_COLUMN));
+	}
+
+	/**
+	 * Whether this entry matched at least one topic while carrying exactly $contentHash, i.e. whether its content
+	 * is unchanged since the match(es) recorded for it. An entry that has since changed is either already
+	 * re-queued for reclassification or waiting to be, so acting on its stale match here would risk marking it
+	 * read (or not) based on a decision the current content was never actually judged against.
+	 */
+	public function hasMatchingSourceContentHash(string $entryId, string $contentHash): bool {
+		return $this->row('SELECT 1 FROM sources WHERE entry_id=? AND content_hash=? LIMIT 1', [$entryId, $contentHash]) !== null;
+	}
+
 	public function removeSourceMembership(int $topicId, string $entryId): bool {
 		$source = $this->row('SELECT event_id FROM sources WHERE topic_id=? AND entry_id=?', [$topicId, $entryId]);
 		if ($source === null) {
 			return false;
 		}
 		$this->execute('DELETE FROM sources WHERE topic_id=? AND entry_id=?', [$topicId, $entryId]);
-		$this->removeEmptyEvent((int)$source['event_id']);
+		$this->removeEmptyEvent((int)$source['event_id'], $entryId);
 		return true;
 	}
 
@@ -720,9 +750,13 @@ final class TopicDigestStore {
 			}
 			$newEvent = $eventId === null;
 			if ($eventId === null) {
-				$this->execute('INSERT INTO events(topic_id,title,occurred_at,explanation,embedding,fingerprint,created_at,updated_at) '
-					. 'VALUES(?,?,?,?,?,?,?,?)', [$topicId, mb_substr($eventTitle, 0, 1000), $occurredAt,
-						mb_substr($explanation, 0, 4000), json_encode($embedding, JSON_THROW_ON_ERROR), $fingerprint, $now, $now]);
+				// primary_entry_id records the source that opened this event, i.e. the one materialised as its own
+				// entry in a high-priority feed: later sources joining the same event are recorded here too, but
+				// do not get a further entry of their own (see TopicDigestExtension::synchroniseHighPriorityFeed()).
+				$this->execute('INSERT INTO events(topic_id,title,occurred_at,explanation,embedding,fingerprint,'
+					. 'primary_entry_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)', [$topicId,
+						mb_substr($eventTitle, 0, 1000), $occurredAt, mb_substr($explanation, 0, 4000),
+						json_encode($embedding, JSON_THROW_ON_ERROR), $fingerprint, $job['entry_id'], $now, $now]);
 				$eventId = (int)$this->pdo->lastInsertId();
 			} else {
 				$this->execute("UPDATE events SET occurred_at=MAX(occurred_at,?),"
@@ -764,7 +798,7 @@ final class TopicDigestStore {
 		$this->execute('INSERT OR IGNORE INTO rejections(topic_id,entry_id,fingerprint,created_at) VALUES(?,?,?,?)',
 			[$topicId, $entryId, '', time()]);
 		$this->execute('DELETE FROM sources WHERE topic_id=? AND entry_id=?', [$topicId, $entryId]);
-		$this->removeEmptyEvent((int)$source['event_id']);
+		$this->removeEmptyEvent((int)$source['event_id'], $entryId);
 		$this->createSuggestion($topicId, 'Exclude items like: ' . (string)$source['title'],
 			(string)$source['title'], (string)$source['link']);
 		return [$entryId];
@@ -793,9 +827,25 @@ final class TopicDigestStore {
 		return $ids;
 	}
 
-	private function removeEmptyEvent(int $eventId): void {
-		if ($this->row('SELECT 1 FROM sources WHERE event_id=? LIMIT 1', [$eventId]) === null) {
+	/**
+	 * Deletes the event once it has no sources left. Otherwise, if the source just removed was the event's
+	 * primary_entry_id (the one materialised as its own entry in a high-priority feed), promotes the
+	 * next-earliest remaining source so the following synchroniseTopic(..., prune: true) re-materialises under
+	 * the new primary and removes the old one — instead of leaving the event pointing at a source that is no
+	 * longer a member, which a high-priority sync could neither find nor prune.
+	 */
+	private function removeEmptyEvent(int $eventId, string $removedEntryId = ''): void {
+		$remaining = $this->row('SELECT entry_id FROM sources WHERE event_id=? ORDER BY added_at ASC LIMIT 1', [$eventId]);
+		if ($remaining === null) {
 			$this->execute('DELETE FROM events WHERE id=?', [$eventId]);
+			return;
+		}
+		if ($removedEntryId === '') {
+			return;
+		}
+		$event = $this->row('SELECT primary_entry_id FROM events WHERE id=?', [$eventId]);
+		if ($event !== null && (string)$event['primary_entry_id'] === $removedEntryId) {
+			$this->execute('UPDATE events SET primary_entry_id=? WHERE id=?', [(string)$remaining['entry_id'], $eventId]);
 		}
 	}
 

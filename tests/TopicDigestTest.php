@@ -5,7 +5,11 @@ use PHPUnit\Framework\TestCase;
 
 require_once dirname(__DIR__) . '/TopicDigestStore.php';
 require_once dirname(__DIR__) . '/ArticleSummaryCache.php';
+require_once dirname(__DIR__) . '/TopicDigestTextProvider.php';
 require_once dirname(__DIR__) . '/TopicDigestOllama.php';
+require_once dirname(__DIR__) . '/TopicDigestOpenAICompatible.php';
+require_once dirname(__DIR__) . '/TopicDigestTextProviderChain.php';
+require_once dirname(__DIR__) . '/TopicDigestConcurrentDispatcher.php';
 require_once dirname(__DIR__) . '/TopicDigestProcessor.php';
 
 final class TopicDigestTest extends TestCase {
@@ -1047,6 +1051,421 @@ final class TopicDigestTest extends TestCase {
 		self::assertSame(-1.0, TopicDigestProcessor::cosine([1.0], [1.0, 2.0]));
 	}
 
+	// -- TopicDigestOpenAICompatible ---------------------------------------------------------------------------
+
+	public function testOpenAiCompatibleProducesStructuredSummaryViaChatCompletions(): void {
+		$transport = static fn(string $method, string $url, ?array $payload, array $headers): array => [
+			'choices' => [['message' => ['content' => json_encode(['summary' => 'GLM-5.3 was released.',
+				'event_title' => 'GLM-5.3 released', 'event_date' => '2026-01-01'], JSON_THROW_ON_ERROR)],
+				'finish_reason' => 'stop']],
+		];
+		$provider = new TopicDigestOpenAICompatible('https://openrouter.ai/api/v1', 'sk-test', 10, $transport);
+		$result = $provider->summarise('openai/gpt-oss-20b', 'Title', 'Substantial article text.', 1_700_000_000);
+		self::assertSame('GLM-5.3 was released.', $result['summary']);
+		self::assertSame('GLM-5.3 released', $result['event_title']);
+	}
+
+	public function testOpenAiCompatibleSendsBearerAuthenticationButNotToTheStructuringEndpoint(): void {
+		$calls = [];
+		$transport = static function (string $method, string $url, ?array $payload, array $headers) use (&$calls): array {
+			$calls[] = ['url' => $url, 'headers' => $headers];
+			if (str_contains($url, '/api/chat')) {
+				return ['message' => ['content' => json_encode(['summary' => 'S', 'event_title' => 'T',
+					'event_date' => '2026-01-01'], JSON_THROW_ON_ERROR)]];
+			}
+			return ['choices' => [['message' => ['content' => '**Summary:** prose, not JSON.'], 'finish_reason' => 'stop']]];
+		};
+		$provider = new TopicDigestOpenAICompatible('https://api.groq.com/openai/v1', 'sk-secret', 10, $transport,
+			structuringUrl: 'http://ollama-local', structuringModel: 'structuring-model');
+		$provider->summarise('model', 'Title', 'Substantial article text.', 1_700_000_000);
+
+		self::assertCount(2, $calls);
+		self::assertStringContainsString('/chat/completions', $calls[0]['url']);
+		self::assertSame('Bearer sk-secret', $calls[0]['headers']['Authorization'] ?? null);
+		self::assertStringContainsString('/api/chat', $calls[1]['url']);
+		self::assertArrayNotHasKey('Authorization', $calls[1]['headers']);
+	}
+
+	public function testOpenAiCompatibleBatchesTopicDecisionsInOneRequest(): void {
+		$calls = 0;
+		$transport = static function (string $method, string $url, ?array $payload) use (&$calls): array {
+			$calls++;
+			return ['choices' => [['message' => ['content' => json_encode(['decisions' => [
+				['topic_id' => 1, 'matches' => true, 'confidence' => 0.9, 'reason' => 'It reports a release.',
+					'event_title' => 'Model released'],
+				['topic_id' => 2, 'matches' => false, 'confidence' => 0.1, 'reason' => 'Unrelated.', 'event_title' => ''],
+			]], JSON_THROW_ON_ERROR)], 'finish_reason' => 'stop']]];
+		};
+		$topics = [
+			['id' => 1, 'name' => 'AI releases', 'description' => 'New model releases', 'exclusions' => []],
+			['id' => 2, 'name' => 'Physics', 'description' => 'New experimental results', 'exclusions' => []],
+		];
+		$provider = new TopicDigestOpenAICompatible('https://openrouter.ai/api/v1', 'sk-test', 10, $transport);
+		$result = $provider->matchTopics('model', ['summary' => 'A model was released.', 'event_title' => 'Model released'], $topics);
+		self::assertSame(1, $calls);
+		self::assertTrue($result[1]['matches']);
+		self::assertFalse($result[2]['matches']);
+	}
+
+	public function testOpenAiCompatibleBatchesEventDecisions(): void {
+		$transport = static fn(string $method, string $url, ?array $payload): array => [
+			'choices' => [['message' => ['content' => json_encode(['decisions' => [
+				['candidate_id' => 'e:1', 'same_event' => true, 'confidence' => 0.9, 'reason' => 'Same release.'],
+			]], JSON_THROW_ON_ERROR)], 'finish_reason' => 'stop']],
+		];
+		$provider = new TopicDigestOpenAICompatible('https://openrouter.ai/api/v1', 'sk-test', 10, $transport);
+		$result = $provider->sameEvents('model', ['summary' => 'Release'], [
+			['candidate_id' => 'e:1', 'title' => 'Release', 'occurred_at' => 1_700_000_000, 'explanation' => 'Release'],
+		]);
+		self::assertTrue($result['e:1']['same_event']);
+	}
+
+	public function testOpenAiCompatibleReshapesAFlatBooleanMapIntoTopicDecisions(): void {
+		$transport = static fn(string $method, string $url, ?array $payload): array => [
+			'choices' => [['message' => ['content' => json_encode(['1' => true, '2' => 'no'], JSON_THROW_ON_ERROR)],
+				'finish_reason' => 'stop']],
+		];
+		$topics = [
+			['id' => 1, 'name' => 'AI releases', 'description' => 'New model releases', 'exclusions' => []],
+			['id' => 2, 'name' => 'Physics', 'description' => 'New experimental results', 'exclusions' => []],
+		];
+		$provider = new TopicDigestOpenAICompatible('https://openrouter.ai/api/v1', 'sk-test', 10, $transport);
+		$result = $provider->matchTopics('model', ['summary' => 'A model was released.', 'event_title' => 'Model released'], $topics);
+		self::assertTrue($result[1]['matches']);
+		self::assertFalse($result[2]['matches']);
+	}
+
+	public function testOpenAiCompatibleRecoversJsonFromProseViaLocalStructuringFallback(): void {
+		$calls = 0;
+		$transport = static function (string $method, string $url, ?array $payload) use (&$calls): array {
+			$calls++;
+			if ($calls === 1) {
+				return ['choices' => [['message' => ['content' => '**Event Title:** Something happened '
+					. '**Summary:** Prose, not JSON.'], 'finish_reason' => 'stop']]];
+			}
+			self::assertSame('structuring-model', $payload['model'] ?? null);
+			return ['message' => ['content' => json_encode(['summary' => 'Prose, not JSON.',
+				'event_title' => 'Something happened', 'event_date' => '2026-01-01'], JSON_THROW_ON_ERROR)]];
+		};
+		$provider = new TopicDigestOpenAICompatible('https://openrouter.ai/api/v1', 'sk-test', 10, $transport,
+			structuringUrl: 'http://ollama-local', structuringModel: 'structuring-model');
+		$result = $provider->summarise('model', 'Title', 'Substantial article text.', 1_700_000_000);
+		self::assertSame(2, $calls);
+		self::assertSame('Something happened', $result['event_title']);
+	}
+
+	public function testOpenAiCompatibleThrowsWhenProseAndNoStructuringFallbackConfigured(): void {
+		$transport = static fn(string $method, string $url, ?array $payload): array => [
+			'choices' => [['message' => ['content' => 'Prose, not JSON.'], 'finish_reason' => 'stop']],
+		];
+		$provider = new TopicDigestOpenAICompatible('https://openrouter.ai/api/v1', 'sk-test', 10, $transport);
+		$this->expectException(RuntimeException::class);
+		$provider->summarise('model', 'Title', 'Substantial article text.', 1_700_000_000);
+	}
+
+	public function testOpenAiCompatibleStillRejectsAReplyMissingARequiredField(): void {
+		$transport = static fn(string $method, string $url, ?array $payload): array => [
+			'choices' => [['message' => ['content' => json_encode(['summary' => 'Summary', 'event_title' => 'Title'],
+				JSON_THROW_ON_ERROR)], 'finish_reason' => 'stop']],
+		];
+		$provider = new TopicDigestOpenAICompatible('https://openrouter.ai/api/v1', 'sk-test', 10, $transport);
+		$this->expectException(RuntimeException::class);
+		$provider->summarise('model', 'Title', 'Substantial article text.', 1_700_000_000);
+	}
+
+	public function testOpenAiCompatibleDropsAdditionalStructuredFieldsInsteadOfLosingTheAnswer(): void {
+		$transport = static fn(string $method, string $url, ?array $payload): array => [
+			'choices' => [['message' => ['content' => json_encode(['summary' => 'Summary', 'event_title' => 'Title',
+				'event_date' => '2026-01-01', 'extra' => 'ignored'], JSON_THROW_ON_ERROR)], 'finish_reason' => 'stop']],
+		];
+		$provider = new TopicDigestOpenAICompatible('https://openrouter.ai/api/v1', 'sk-test', 10, $transport);
+		self::assertSame(['summary' => 'Summary', 'event_title' => 'Title', 'event_date' => '2026-01-01'],
+			$provider->summarise('model', 'Title', 'Substantial article text.', 1_700_000_000));
+	}
+
+	public function testOpenAiCompatibleRetriesWithoutResponseFormatWhenTheEndpointRejectsIt(): void {
+		$calls = 0;
+		$transport = static function (string $method, string $url, ?array $payload) use (&$calls): array {
+			$calls++;
+			if ($calls === 1) {
+				self::assertArrayHasKey('response_format', $payload);
+				throw new RuntimeException('OpenAI-compatible request failed: POST ' . $url
+					. ' (HTTP 400; response: response_format.json_schema is not supported by this model).');
+			}
+			self::assertArrayNotHasKey('response_format', $payload);
+			self::assertArrayNotHasKey('reasoning_effort', $payload);
+			return ['choices' => [['message' => ['content' => json_encode(['summary' => 'S', 'event_title' => 'T',
+				'event_date' => '2026-01-01'], JSON_THROW_ON_ERROR)], 'finish_reason' => 'stop']]];
+		};
+		$provider = new TopicDigestOpenAICompatible('https://api.groq.com/openai/v1', 'sk-test', 10, $transport);
+		$result = $provider->summarise('model', 'Title', 'Substantial article text.', 1_700_000_000);
+		self::assertSame(2, $calls);
+		self::assertSame('S', $result['summary']);
+	}
+
+	public function testOpenAiCompatibleCapsReasoningEffortAndRetriesWithABiggerBudgetIfStillEmpty(): void {
+		$calls = 0;
+		$transport = static function (string $method, string $url, ?array $payload) use (&$calls): array {
+			$calls++;
+			if ($calls === 1) {
+				self::assertSame('low', $payload['reasoning_effort'] ?? null);
+				self::assertSame(1600, $payload['max_tokens'] ?? null);
+				return ['choices' => [['message' => ['role' => 'assistant', 'content' => null], 'finish_reason' => 'length']]];
+			}
+			self::assertSame(12800, $payload['max_tokens'] ?? null);
+			return ['choices' => [['message' => ['content' => json_encode(['summary' => 'Recovered summary.',
+				'event_title' => 'Recovered', 'event_date' => '2026-01-01'], JSON_THROW_ON_ERROR)],
+				'finish_reason' => 'stop']]];
+		};
+		$provider = new TopicDigestOpenAICompatible('https://openrouter.ai/api/v1', 'sk-test', 10, $transport);
+		$result = $provider->summarise('gpt-5-nano', 'Title', 'Substantial article text.', 1_700_000_000);
+		self::assertSame(2, $calls);
+		self::assertSame('Recovered summary.', $result['summary']);
+	}
+
+	public function testOpenAiCompatibleApiKeyNeverAppearsInARealRequestFailureMessage(): void {
+		// Deliberately not using the transport closure here: it bypasses the real curl request-building code
+		// entirely, which is exactly the code that must never interpolate the key into an exception message.
+		// A closed local port fails instantly with no network access required.
+		$provider = new TopicDigestOpenAICompatible('http://127.0.0.1:1', 'sk-super-secret-value', 1);
+		try {
+			$provider->test(['some-model']);
+			self::fail('A connection to a closed port must fail.');
+		} catch (Throwable $e) {
+			self::assertStringNotContainsString('sk-super-secret-value', $e->getMessage());
+			self::assertStringNotContainsString('Bearer', $e->getMessage());
+		}
+	}
+
+	// -- TopicDigestTextProviderChain ---------------------------------------------------------------------------
+
+	public function testChainUsesThePrimaryProviderWhenNotInCooldown(): void {
+		$primary = new TopicDigestTestFakeTextProvider('primary summary', 'primary event');
+		$fallback = new TopicDigestTestFakeTextProvider('fallback summary', 'fallback event');
+		$chain = new TopicDigestTextProviderChain($primary, 'primary-summary-model', 'primary-judge-model', 'ollama',
+			$fallback, 'fallback-summary-model', 'fallback-judge-model', 'openai-compatible', primaryInCooldown: false);
+
+		self::assertFalse($chain->usesFallback());
+		self::assertSame($primary, $chain->provider());
+		self::assertSame('primary-summary-model', $chain->summaryModel());
+		self::assertSame('ollama|primary-judge-model', $chain->judgeModelIdentity());
+		self::assertSame('ollama', $chain->providerType());
+	}
+
+	public function testChainSwitchesToTheFallbackProviderWhenThePrimaryIsInCooldown(): void {
+		$primary = new TopicDigestTestFakeTextProvider('primary summary', 'primary event');
+		$fallback = new TopicDigestTestFakeTextProvider('fallback summary', 'fallback event');
+		$chain = new TopicDigestTextProviderChain($primary, 'primary-summary-model', 'primary-judge-model', 'ollama',
+			$fallback, 'fallback-summary-model', 'fallback-judge-model', 'openai-compatible', primaryInCooldown: true);
+
+		self::assertTrue($chain->usesFallback());
+		self::assertSame($fallback, $chain->provider());
+		self::assertSame('fallback-summary-model', $chain->summaryModel());
+		self::assertSame('openai-compatible|fallback-judge-model', $chain->judgeModelIdentity());
+		// This is the switch TopicDigestProcessor::runActive() checks to decide whether worker concurrency may
+		// actually dispatch several articles at once: 'ollama' as the primary must never enable it, but a
+		// fallback that switches the *effective* provider to 'openai-compatible' should.
+		self::assertSame('openai-compatible', $chain->providerType());
+	}
+
+	public function testChainStaysOnThePrimaryWhenNoFallbackIsConfiguredEvenDuringCooldown(): void {
+		$primary = new TopicDigestTestFakeTextProvider('primary summary', 'primary event');
+		$chain = new TopicDigestTextProviderChain($primary, 'primary-summary-model', 'primary-judge-model', 'ollama',
+			null, null, null, null, primaryInCooldown: true);
+
+		self::assertFalse($chain->hasFallback());
+		self::assertFalse($chain->usesFallback());
+		self::assertSame($primary, $chain->provider());
+	}
+
+	public function testChainRejectsAFallbackProviderWithoutItsModelsOrLabel(): void {
+		$primary = new TopicDigestTestFakeTextProvider('s', 'e');
+		$fallback = new TopicDigestTestFakeTextProvider('s', 'e');
+		$this->expectException(InvalidArgumentException::class);
+		new TopicDigestTextProviderChain($primary, 'primary-summary-model', 'primary-judge-model', 'ollama',
+			$fallback, null, 'fallback-judge-model', 'openai-compatible', primaryInCooldown: false);
+	}
+
+	// -- Generalized fallback tracking in TopicDigestStore -------------------------------------------------------
+
+	public function testPrimaryTextFallbackTrackingIsIndependentOfTheLegacyCloudTracking(): void {
+		self::assertSame(0, $this->store->primaryTextFallbackUntil());
+		$this->store->markPrimaryTextFallback(1_700_001_000);
+		self::assertSame(1_700_001_000, $this->store->primaryTextFallbackUntil());
+		// The legacy Ollama Cloud->local mechanism is untouched by the generalized one.
+		self::assertSame(0, $this->store->cloudUnavailableUntil());
+	}
+
+	public function testEmbeddingIdentityTrackingIsSeparateFromLegacyProfileTracking(): void {
+		self::assertNull($this->store->lastEmbeddingIdentity());
+		$this->store->setLastEmbeddingIdentity('ollama|http://ollama:11434|qwen3-embedding:0.6b');
+		self::assertSame('ollama|http://ollama:11434|qwen3-embedding:0.6b', $this->store->lastEmbeddingIdentity());
+		// Unrelated to the (still-present, still-tested) legacy profile tracker.
+		self::assertNull($this->store->lastOllamaProfile());
+	}
+
+	// -- TopicDigestConcurrentDispatcher (worker concurrency) -----------------------------------------------------
+
+	public function testDispatcherStartsEveryOperationBeforeAnyResumes(): void {
+		$dispatcher = new TopicDigestConcurrentDispatcher(5, 5);
+		$order = [];
+		$dispatcher->run([
+			function () use (&$order): void {
+				$order[] = 'a-start';
+				Fiber::suspend();
+				$order[] = 'a-resume';
+			},
+			function () use (&$order): void {
+				$order[] = 'b-start';
+				Fiber::suspend();
+				$order[] = 'b-resume';
+			},
+		]);
+		// If run() ran the first operation to completion before even starting the second (i.e. was secretly
+		// sequential), 'b-start' could never appear before 'a-resume'.
+		self::assertSame(['a-start', 'b-start'], array_slice($order, 0, 2));
+	}
+
+	public function testDispatcherIsolatesOneOperationsFailureFromTheOthers(): void {
+		$dispatcher = new TopicDigestConcurrentDispatcher(5, 5);
+		$results = $dispatcher->run([
+			fn(): string => 'ok-1',
+			fn(): string => throw new RuntimeException('task 2 failed'),
+			fn(): string => 'ok-3',
+		]);
+		self::assertSame(['value' => 'ok-1', 'error' => null], $results[0]);
+		self::assertNull($results[1]['value']);
+		self::assertInstanceOf(RuntimeException::class, $results[1]['error']);
+		self::assertSame('task 2 failed', $results[1]['error']->getMessage());
+		self::assertSame(['value' => 'ok-3', 'error' => null], $results[2]);
+	}
+
+	public function testDispatcherClassifiesQuotaStatusCodesFromEitherTransport(): void {
+		$dispatcher = new TopicDigestConcurrentDispatcher(5, 5);
+		$server = @stream_socket_server('tcp://127.0.0.1:0', $errno, $errstr);
+		if ($server === false) {
+			self::markTestSkipped("Cannot bind a loopback socket: {$errstr}");
+		}
+		$name = stream_socket_get_name($server, false);
+		$port = (int)substr($name, strrpos($name, ':') + 1);
+		$respond = function () use ($server): void {
+			$conn = stream_socket_accept($server, 5.0);
+			self::assertNotFalse($conn);
+			stream_set_blocking($conn, true);
+			while (!str_contains((string)fread($conn, 8192), "\r\n\r\n")) {
+			}
+			$body = '{"error":"rate limited"}';
+			fwrite($conn, "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: "
+				. strlen($body) . "\r\nConnection: close\r\n\r\n" . $body);
+			fclose($conn);
+			fclose($server);
+		};
+		$transport = $dispatcher->openAiTransport();
+		$results = $dispatcher->run([
+			function () use ($transport, $port): array {
+				return $transport('POST', "http://127.0.0.1:{$port}/chat/completions", ['model' => 'x'], []);
+			},
+			function () use ($respond): void {
+				$respond();
+			},
+		]);
+		self::assertInstanceOf(OllamaQuotaExceededException::class, $results[0]['error']);
+	}
+
+	public function testDispatcherRunsTwoRealRequestsConcurrentlyNotSerially(): void {
+		if (!extension_loaded('pcntl') || !extension_loaded('posix')) {
+			self::markTestSkipped('pcntl/posix are required to prove genuine overlap with a forking loopback server.');
+		}
+		$serverScript = sys_get_temp_dir() . '/topic-digest-loopback-' . bin2hex(random_bytes(8)) . '.php';
+		// Forks a child per accepted connection so both requests are served in parallel: a server that instead
+		// handled them one at a time would itself be the serial bottleneck, since a TCP connection completing
+		// does not require the server to have called accept() yet, making a non-forking server unable to prove
+		// anything about the *dispatcher's* concurrency.
+		file_put_contents($serverScript, <<<'PHP'
+<?php
+$port = (int)$argv[1];
+$server = stream_socket_server("tcp://127.0.0.1:{$port}", $errno, $errstr);
+if ($server === false) {
+	exit(1);
+}
+$children = [];
+for ($i = 0; $i < 2; $i++) {
+	$conn = stream_socket_accept($server, 10.0);
+	if ($conn === false) {
+		exit(1);
+	}
+	$pid = pcntl_fork();
+	if ($pid === 0) {
+		stream_set_blocking($conn, true);
+		while (!str_contains((string)fread($conn, 8192), "\r\n\r\n")) {
+		}
+		usleep(400_000);
+		$body = '{"choices":[{"message":{"content":"ok"}}]}';
+		fwrite($conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+			. strlen($body) . "\r\nConnection: close\r\n\r\n" . $body);
+		fclose($conn);
+		exit(0);
+	}
+	$children[] = $pid;
+	fclose($conn);
+}
+foreach ($children as $pid) {
+	pcntl_waitpid($pid, $status);
+}
+PHP);
+		$port = random_int(20000, 60000);
+		$process = proc_open([PHP_BINARY, $serverScript, (string)$port], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+		self::assertNotFalse($process);
+		usleep(200_000);
+		try {
+			$dispatcher = new TopicDigestConcurrentDispatcher(5, 8);
+			$transportA = $dispatcher->openAiTransport();
+			$transportB = $dispatcher->openAiTransport();
+			$startedAt = microtime(true);
+			$results = $dispatcher->run([
+				fn(): array => $transportA('POST', "http://127.0.0.1:{$port}/chat/completions", ['model' => 'x'], []),
+				fn(): array => $transportB('POST', "http://127.0.0.1:{$port}/chat/completions", ['model' => 'x'], []),
+			]);
+			$elapsed = microtime(true) - $startedAt;
+		} finally {
+			proc_terminate($process);
+			proc_close($process);
+			unlink($serverScript);
+		}
+		self::assertNull($results[0]['error']);
+		self::assertNull($results[1]['error']);
+		self::assertSame('ok', $results[0]['value']['choices'][0]['message']['content']);
+		// Two responses each deliberately delayed ~0.4s: a dispatcher that only ever has one curl handle in
+		// flight at a time (i.e. is secretly serial despite the API looking concurrent) takes >=0.8s; a
+		// genuinely concurrent one takes roughly one delay's worth of wall time. Generous margin to avoid
+		// flakiness on a loaded CI runner.
+		self::assertLessThan(0.75, $elapsed);
+	}
+
+	// -- Queue claiming under concurrency --------------------------------------------------------------------
+
+	public function testClaimCalledSeriallyYieldsDistinctNonOverlappingJobs(): void {
+		$ids = [];
+		for ($i = 0; $i < 4; $i++) {
+			$entry = new FreshRSS_Entry(4, 'guid-' . $i, 'Article ' . $i, '', 'Body',
+				'https://example.com/' . $i, 1_700_000_000 + $i);
+			$entry->_id('170000000000000' . $i);
+			$this->store->enqueue($entry, 2, 'pipeline', 100 - $i);
+			$ids[] = $entry->id();
+		}
+		$claimed = [];
+		for ($i = 0; $i < 4; $i++) {
+			$job = $this->store->claim(600);
+			self::assertNotNull($job);
+			$claimed[] = $job['entry_id'];
+		}
+		// Claimed in priority order (highest first), matching claim()'s own ordering — and, crucially,
+		// distinct: no entry_id repeats, so calling claim() serially to gather a wavefront never double-claims.
+		self::assertSame($ids, $claimed);
+		self::assertSame(4, count(array_unique($claimed)));
+		self::assertNull($this->store->claim(600), 'A fifth call finds nothing left to claim.');
+	}
+
 	/** @return array<string,mixed> */
 	private function job(string $entryId, string $title): array {
 		return [
@@ -1054,5 +1473,42 @@ final class TopicDigestTest extends TestCase {
 			'author' => '', 'link' => 'https://example.com/' . $entryId, 'published_at' => 1_700_000_000,
 			'content_hash' => hash('md5', $title), 'pipeline_hash' => 'pipeline', 'rss_text' => 'Article',
 		];
+	}
+}
+
+/** A minimal TopicDigestTextProvider double for TopicDigestTextProviderChain tests: no network, no FreshRSS. */
+final class TopicDigestTestFakeTextProvider implements TopicDigestTextProvider {
+	public function __construct(private readonly string $summary, private readonly string $eventTitle) {
+	}
+
+	public function test(array $models): void {
+	}
+
+	public function summarise(string $model, string $title, string $text, int $publishedAt): array {
+		return ['summary' => $this->summary, 'event_title' => $this->eventTitle, 'event_date' => '2026-01-01'];
+	}
+
+	public function matchTopic(string $model, array $summary, array $topic): array {
+		return ['matches' => true, 'confidence' => 1.0, 'reason' => 'fake', 'event_title' => $this->eventTitle];
+	}
+
+	public function matchTopics(string $model, array $summary, array $topics): array {
+		$result = [];
+		foreach ($topics as $topic) {
+			$result[(int)$topic['id']] = $this->matchTopic($model, $summary, $topic);
+		}
+		return $result;
+	}
+
+	public function sameEvent(string $model, array $summary, array $event): array {
+		return ['same_event' => true, 'confidence' => 1.0, 'reason' => 'fake'];
+	}
+
+	public function sameEvents(string $model, array $summary, array $events): array {
+		$result = [];
+		foreach ($events as $event) {
+			$result[(string)$event['candidate_id']] = $this->sameEvent($model, $summary, $event);
+		}
+		return $result;
 	}
 }

@@ -1,5 +1,124 @@
 # Changelog
 
+## 0.7.0 - 2026-09-01
+
+- Add configurable worker concurrency (`worker_concurrency`, 1-8, default 1)
+  so several articles' text inference (summarization, topic judging) can run
+  concurrently against an OpenAI-compatible endpoint instead of strictly one
+  article at a time, while everything that mutates shared event/source/feed
+  state still commits one article at a time — so two articles about the same
+  real-world event can never race into creating two separate events. The
+  default (1) reproduces the original, fully sequential worker exactly; no
+  action is required on upgrade.
+- **Concurrency only ever applies to an OpenAI-compatible endpoint.** Ollama
+  has no equivalent of an OpenAI-compatible API's multi-tenant
+  concurrent-request handling and this project's own recommended models
+  already target modest CPU/GPU hardware, so `worker_concurrency` is
+  silently ignored (processing stays fully sequential) whenever the
+  effective text provider is local Ollama or Ollama Cloud. Embeddings,
+  which always go to Ollama regardless of which text provider is
+  configured, are likewise never dispatched concurrently, even while text
+  inference to an OpenAI-compatible endpoint is running concurrently for
+  the same batch.
+- Add `--concurrency` to `cli/daemon.php` and `cli/process.php`, defaulting
+  to the configured `worker_concurrency` when omitted. `--batch`/`--limit`
+  keep their existing meaning (total articles per invocation); concurrency
+  only bounds how many of them may be worked on at once.
+- Add a `TopicDigestConcurrentDispatcher` (Fiber + a single shared
+  `curl_multi` handle) that drives several articles' provider calls in
+  parallel, reusing the same transport-injection seam the settings page's
+  "Test connection" feature already used. Provider/model-change cache
+  invalidation, quota-driven fallback, and the API-key handling rules are
+  unchanged; a quota failure seen by several concurrent articles at once
+  still starts only one fallback cooldown, not one per article.
+- See the README's new "Worker concurrency" section for the recommended
+  starting value (4) against an OpenAI-compatible endpoint and when 8 is
+  worth trying.
+- Fix `save_settings` and `save_topic` resetting the entire backlog to
+  pending on *every* save, regardless of whether anything that
+  `pipelineHash()` actually cares about changed. Both actions called
+  `startBackfill()` unconditionally, which bumps a revision counter that is
+  itself part of `pipelineHash()`'s input — so the hash changed on every
+  save as a side effect of saving, independent of its own content. This
+  defeated, in particular, excluding the judge model from `pipelineHash()`
+  earlier in this release: saving a new judge model with nothing else
+  changed still forced a full reclassification through this side channel.
+  Both actions now compare `pipelineHash()` before and after the save and
+  only start a backfill when it actually changed, the same pattern already
+  used correctly by News Deduplicator's equivalent save action.
+- Fix the archive backfill scan stopping partway through the archive (e.g.
+  around 500 articles on an installation with ~8k) instead of covering the
+  whole history. It treated any page of fewer than 100 entries as proof it
+  had reached the very oldest entry, but FreshRSS prunes/archives old
+  entries over time, so a page can legitimately come back short in a range
+  where many ids are simply gone, while real, older entries still exist
+  further down — the scan stopped there and nothing resumed it. This was
+  previously masked because every settings save reset the scan back to the
+  top as a side effect of the bug fixed above, so it usually got far enough
+  on a subsequent retry; fixing that side effect exposed this one. The scan
+  now only stops on a genuinely empty page. **If your scan already got
+  stuck at some count short of the full archive on an earlier version,
+  fixing this doesn't retroactively resume it** — click "Rescan" once on
+  the settings page after upgrading.
+
+## 0.6.0 - 2026-09-01
+
+- Add a generic OpenAI-compatible text-inference provider (Bearer
+  authentication, standard chat-completions wire format) alongside local and
+  cloud Ollama — usable as the primary text provider or as a fallback for
+  when the primary rejects a request for account/plan reasons (HTTP
+  402/429). No specific provider is hard-coded; OpenRouter and Groq are
+  documented as examples. See the README's "Provider architecture" and
+  "Configuring a primary + fallback" sections.
+- Decouple the embedding provider from text inference entirely: embeddings
+  now always go through a separately configured, Ollama-compatible endpoint
+  regardless of which text provider(s) are in use, instead of implicitly
+  following whichever Ollama profile happened to be active. Existing
+  installs keep their current effective embedding routing automatically
+  (no re-entry needed); cloud-profile installs whose cloud and local
+  embedding model names happened to differ get a one-time re-embed the
+  first time this runs, now that the ambiguity is resolved explicitly in
+  the new "Embedding provider" settings field.
+- Generalize the automatic quota-driven fallback mechanism: it now supports
+  any primary/fallback pairing (not just Ollama Cloud → local Ollama,
+  which remains the default and behaves identically to before), while
+  keeping the same guarantees — the saved primary provider is never
+  changed by an automatic fallback, and a temporary fallback never
+  requeues or invalidates already-processed articles.
+- Internally, refactor the inference layer behind `TopicDigestTextProvider`/
+  `TopicDigestEmbeddingProvider` interfaces and a `TopicDigestTextProviderChain`
+  that resolves the effective provider once per processing batch.
+  `TopicDigestOllama`'s own behavior is unchanged.
+- Cap reasoning effort (`reasoning_effort: "low"`, best-effort, dropped on
+  endpoints that reject it) on OpenAI-compatible requests, and retry once
+  with a much larger token budget on top of that if a reasoning-capable
+  model (e.g. `gpt-5-nano`, `gpt-oss`) still spends its whole budget on
+  hidden reasoning tokens and returns no visible content, instead of failing
+  the article.
+- Run the settings page's "Test connection" checks concurrently instead of
+  one after another, and use a short fixed timeout for them instead of the
+  full (often very large) configured processing timeout.
+- Fix `pipelineHash()`/`analysisHash()` so that installs which never touch
+  the new fallback/OpenAI-compatible/embedding settings keep producing
+  byte-identical hashes to before this release. An earlier build of this
+  change unconditionally enriched both hashes' shape, which forced every
+  install into a one-time full backlog reclassification (recomputing every
+  summary and embedding) purely from upgrading, with no real configuration
+  change behind it — if you already saw a sudden full reprocessing pass
+  after updating, this was why; it will not recur.
+- Stop including the judge model in `pipelineHash()`. It gates the
+  disruptive digest restart (every already-matched article is unmatched and
+  the whole backlog is re-queued), and that restart was never needed for a
+  judge-model change: topic and event decisions already have their own
+  cache keyed on the judge model, so a change is picked up the next time a
+  decision is actually needed, without redoing every decision already made.
+  Changing only the judge model no longer restarts the digest; summary or
+  embedding model changes still do, as before. To deliberately re-judge
+  already-matched articles against a new judge model, restart the digest
+  manually. This is a one-time hash-shape change like the one above, so
+  upgrading to this release still triggers one last full reclassification
+  pass.
+
 ## 0.5.3 - 2026-08-31
 
 - Fix a high-priority topic materialising one unread entry per matched

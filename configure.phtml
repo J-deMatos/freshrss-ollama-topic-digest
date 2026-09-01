@@ -25,17 +25,12 @@
 		<div class="form-group">
 			<div class="group-name"><?= _t('ext.topic_digest.ollama_profile') ?></div>
 			<div class="group-controls">
-				<?php foreach (['local', 'cloud'] as $profileKey): ?>
+				<?php foreach (['local', 'cloud', 'openai_compatible'] as $profileKey): ?>
 					<label><input type="radio" name="ollama_profile" value="<?= $profileKey ?>" data-ollama-profile-radio="1"
 						<?= $this->settings['ollama_profile'] === $profileKey ? 'checked="checked"' : '' ?> />
 						<?= _t('ext.topic_digest.ollama_profile_' . $profileKey) ?></label>
 				<?php endforeach; ?>
 				<p class="help"><?= _t('ext.topic_digest.ollama_profile_help') ?></p>
-				<?php $cloudFallbackUntil = $this->cloudFallbackUntil(); ?>
-				<?php if ($cloudFallbackUntil > time()): ?>
-					<p class="alert alert-warn"><?= _t('ext.topic_digest.cloud_fallback_active',
-						date('Y-m-d H:i', $cloudFallbackUntil)) ?></p>
-				<?php endif; ?>
 			</div>
 		</div>
 		<?php foreach (['local', 'cloud'] as $profileKey): ?>
@@ -51,6 +46,68 @@
 				<?php endforeach; ?>
 			</fieldset>
 		<?php endforeach; ?>
+		<fieldset data-ollama-profile-fields="openai_compatible" data-openai-fields="1">
+			<legend><?= _t('ext.topic_digest.ollama_profile_openai_compatible') ?></legend>
+			<div class="form-group">
+				<label class="group-name" for="openai_base_url"><?= _t('ext.topic_digest.openai_base_url') ?></label>
+				<div class="group-controls"><input class="w100" id="openai_base_url" name="openai_base_url"
+					value="<?= $esc($this->settings['openai_base_url']) ?>" />
+					<p class="help"><?= _t('ext.topic_digest.openai_base_url_help') ?></p>
+				</div>
+			</div>
+			<div class="form-group">
+				<label class="group-name" for="openai_api_key"><?= _t('ext.topic_digest.openai_api_key') ?></label>
+				<div class="group-controls">
+					<input class="w100" type="password" id="openai_api_key" name="openai_api_key" autocomplete="new-password" />
+					<p class="help"><?= _t('ext.topic_digest.openai_api_key_help') ?>
+						<?= $this->hasOpenAiApiKey() ? ' ' . _t('ext.topic_digest.openai_api_key_saved') : '' ?></p>
+					<?php if ($this->hasOpenAiApiKey()): ?>
+						<label><input type="checkbox" name="openai_api_key_clear" value="1" />
+							<?= _t('ext.topic_digest.openai_api_key_clear') ?></label>
+					<?php endif; ?>
+				</div>
+			</div>
+			<div class="form-group">
+				<label class="group-name" for="openai_summary_model"><?= _t('ext.topic_digest.openai_summary_model') ?></label>
+				<div class="group-controls"><input class="w100" id="openai_summary_model" name="openai_summary_model"
+					value="<?= $esc($this->settings['openai_summary_model']) ?>" /></div>
+			</div>
+			<div class="form-group">
+				<label class="group-name" for="openai_judge_model"><?= _t('ext.topic_digest.openai_judge_model') ?></label>
+				<div class="group-controls"><input class="w100" id="openai_judge_model" name="openai_judge_model"
+					value="<?= $esc($this->settings['openai_judge_model']) ?>" /></div>
+			</div>
+		</fieldset>
+		<div class="form-group">
+			<div class="group-name"><?= _t('ext.topic_digest.fallback_text_mode') ?></div>
+			<div class="group-controls">
+				<?php foreach (['local', 'openai_compatible', 'none'] as $modeKey): ?>
+					<label><input type="radio" name="fallback_text_mode" value="<?= $modeKey ?>" data-fallback-mode-radio="1"
+						<?= $this->settings['fallback_text_mode'] === $modeKey ? 'checked="checked"' : '' ?> />
+						<?= _t('ext.topic_digest.fallback_text_mode_' . $modeKey) ?></label>
+				<?php endforeach; ?>
+				<p class="help"><?= _t('ext.topic_digest.fallback_text_mode_help') ?></p>
+				<?php $textFallbackUntil = $this->textFallbackUntil(); ?>
+				<?php if ($textFallbackUntil > time()): ?>
+					<p class="alert alert-warn"><?= _t('ext.topic_digest.text_fallback_active',
+						date('Y-m-d H:i', $textFallbackUntil)) ?></p>
+				<?php endif; ?>
+			</div>
+		</div>
+		<fieldset>
+			<legend><?= _t('ext.topic_digest.embedding_provider') ?></legend>
+			<p class="help"><?= _t('ext.topic_digest.embedding_provider_help') ?></p>
+			<div class="form-group">
+				<label class="group-name" for="embedding_ollama_url"><?= _t('ext.topic_digest.embedding_ollama_url') ?></label>
+				<div class="group-controls"><input class="w100" id="embedding_ollama_url" name="embedding_ollama_url"
+					value="<?= $esc($this->settings['embedding_provider_url']) ?>" /></div>
+			</div>
+			<div class="form-group">
+				<label class="group-name" for="embedding_provider_model"><?= _t('ext.topic_digest.embedding_provider_model') ?></label>
+				<div class="group-controls"><input class="w100" id="embedding_provider_model" name="embedding_provider_model"
+					value="<?= $esc($this->settings['embedding_provider_model']) ?>" /></div>
+			</div>
+		</fieldset>
 		<div class="form-group">
 			<label class="group-name" for="structuring_model"><?= _t('ext.topic_digest.structuring_model') ?></label>
 			<div class="group-controls">
@@ -64,6 +121,14 @@
 			<label class="group-name" for="timeout"><?= _t('ext.topic_digest.timeout') ?></label>
 			<div class="group-controls"><input type="number" id="timeout" name="timeout" min="10" max="7200"
 				value="<?= (int)$this->settings['timeout'] ?>" /></div>
+		</div>
+		<div class="form-group">
+			<label class="group-name" for="worker_concurrency"><?= _t('ext.topic_digest.worker_concurrency') ?></label>
+			<div class="group-controls">
+				<input type="number" id="worker_concurrency" name="worker_concurrency" min="1" max="8"
+					value="<?= (int)$this->settings['worker_concurrency'] ?>" />
+				<p class="help"><?= _t('ext.topic_digest.worker_concurrency_help') ?></p>
+			</div>
 		</div>
 		<div class="form-group"><div class="group-controls"><label><input type="checkbox" name="scraping" value="1"
 			<?= $this->settings['scraping'] ? 'checked="checked"' : '' ?> /> <?= _t('ext.topic_digest.scraping') ?></label></div></div>
@@ -236,6 +301,26 @@
 <?php endforeach; ?>
 
 <h3><?= _t('ext.topic_digest.status') ?></h3>
+<?php $usingFallback = $this->textFallbackUntil() > time(); ?>
+<dl class="topic-digest-status">
+	<dt><?= _t('ext.topic_digest.primary_text_provider') ?></dt>
+	<dd><?= _t('ext.topic_digest.ollama_profile_' . $this->settings['ollama_profile']) ?></dd>
+	<dt><?= _t('ext.topic_digest.effective_text_provider') ?></dt>
+	<dd><?= $usingFallback
+		? _t('ext.topic_digest.effective_text_provider_fallback') . ' (' . _t('ext.topic_digest.fallback_text_mode_'
+			. $this->settings['fallback_text_mode']) . ')'
+		: _t('ext.topic_digest.effective_text_provider_primary') ?></dd>
+	<?php if ($usingFallback): ?>
+		<dt><?= _t('ext.topic_digest.text_fallback_until') ?></dt>
+		<dd><?= $esc(date('Y-m-d H:i', $this->textFallbackUntil())) ?></dd>
+	<?php endif; ?>
+	<dt><?= _t('ext.topic_digest.embedding_provider_status') ?></dt>
+	<dd><?= $esc($this->settings['embedding_provider_url']) ?></dd>
+	<dt><?= _t('ext.topic_digest.embedding_model_status') ?></dt>
+	<dd><?= $esc($this->settings['embedding_provider_model']) ?></dd>
+	<dt><?= _t('ext.topic_digest.worker_concurrency') ?></dt>
+	<dd><?= (int)$this->settings['worker_concurrency'] ?></dd>
+</dl>
 <dl class="topic-digest-status">
 	<?php foreach (['topics', 'events', 'sources', 'queued', 'processing', 'processed', 'done', 'skipped',
 			'retrying', 'failed', 'stale_discarded', 'backfill_active'] as $key): ?>

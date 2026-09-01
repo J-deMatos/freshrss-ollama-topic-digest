@@ -3,25 +3,58 @@ return [
 	'topic_digest' => [
 		'title' => 'Topic Digest',
 		'intro' => 'Organise matching articles as living digests, high-priority feeds, or automatic mark-read rules.',
-		'ollama' => 'Ollama settings',
-		'ollama_profile' => 'Active profile',
-		'ollama_profile_local' => 'Local',
+		'ollama' => 'Text and embedding inference settings',
+		'ollama_profile' => 'Primary text provider',
+		'ollama_profile_local' => 'Local Ollama',
 		'ollama_profile_cloud' => 'Ollama Cloud',
-		'ollama_profile_help' => 'Keep separate URLs and models for local and cloud Ollama, and switch between them '
-			. 'without retyping either. Only the active profile is used; the other stays saved for next time. When '
-			. 'Ollama Cloud is active and it rejects a request for account/plan reasons (e.g. a usage limit), '
-			. 'processing automatically falls back to the local profile for a while, then tries the cloud again.',
+		'ollama_profile_openai_compatible' => 'OpenAI-compatible',
+		'ollama_profile_help' => 'Keep separate URLs and models for local Ollama, cloud Ollama, and an OpenAI-compatible '
+			. 'endpoint, and switch the primary between them without retyping any of them: only the primary is used; '
+			. 'the others stay saved for next time. Configure a fallback below so that when the primary rejects a '
+			. 'request for account/plan reasons (e.g. a usage limit), processing automatically continues through the '
+			. 'fallback for a while, then tries the primary again — the saved primary choice itself never changes.',
 		'cloud_fallback_active' => 'Ollama Cloud is currently unavailable (account/plan limit); automatically using '
 			. 'the local profile until at least %s.',
 		'ollama_url' => 'Ollama URL',
 		'summary_model' => 'Summary model',
 		'judge_model' => 'Decision model',
 		'embedding_model' => 'Embedding model',
+		'fallback_text_mode' => 'Fallback text provider',
+		'fallback_text_mode_local' => 'Local Ollama (default)',
+		'fallback_text_mode_openai_compatible' => 'OpenAI-compatible',
+		'fallback_text_mode_none' => 'Disabled',
+		'fallback_text_mode_help' => 'Used only while the primary text provider is rejecting requests for account/plan '
+			. 'reasons. "Local Ollama" reproduces the original automatic Ollama Cloud fallback. This never changes the '
+			. 'saved primary provider, and a temporary fallback does not requeue or recompute already-processed '
+			. 'articles — it just lets processing continue through it and reuses whatever is already cached.',
+		'text_fallback_active' => 'Currently using the fallback text provider (the primary hit an account/plan limit); '
+			. 'automatically trying the primary again after %s.',
+		'openai_base_url' => 'Base URL',
+		'openai_base_url_help' => 'An OpenAI-compatible chat-completions endpoint, e.g. https://openrouter.ai/api/v1 '
+			. 'or https://api.groq.com/openai/v1. Never assumed to be a specific provider.',
+		'openai_api_key' => 'API key',
+		'openai_api_key_help' => 'Stored with your other Topic Digest settings. Leave blank to keep the saved key '
+			. 'unchanged; it is never shown here again once saved, and never appears in logs, errors, or the status page.',
+		'openai_api_key_saved' => 'A key is already saved.',
+		'openai_api_key_clear' => 'Clear the saved API key',
+		'openai_summary_model' => 'Summary model',
+		'openai_judge_model' => 'Decision model',
+		'embedding_provider' => 'Embedding provider',
+		'embedding_provider_help' => 'Always Ollama-compatible and fully independent of whichever text provider(s) '
+			. 'are configured above — an OpenAI-compatible provider is never sent embedding requests.',
+		'embedding_ollama_url' => 'Embedding Ollama URL',
+		'embedding_provider_model' => 'Embedding model',
 		'structuring_model' => 'Structuring model (optional)',
 		'structuring_model_help' => 'Runs on the local profile\'s URL to re-extract a JSON reply when a primary '
-			. 'endpoint (e.g. Ollama Cloud, which does not support the JSON schema constraint) returns unstructured '
-			. 'text instead. Leave blank to use the local profile\'s summary model.',
+			. 'endpoint (e.g. Ollama Cloud, or many OpenAI-compatible endpoints) returns unstructured text instead. '
+			. 'Leave blank to use the local profile\'s summary model.',
 		'timeout' => 'Timeout (seconds)',
+		'worker_concurrency' => 'Worker concurrency',
+		'worker_concurrency_help' => 'How many articles may perform inference at the same time (1-8). Not batch '
+			. 'size: this only controls overlap of expensive provider calls within whatever number of articles '
+			. 'the worker already considers per run. Only takes effect against an OpenAI-compatible endpoint — '
+			. 'ignored while local Ollama or Ollama Cloud is the effective text provider, which always stays '
+			. 'fully sequential regardless of this setting.',
 		'scraping' => 'Fetch article pages when RSS content is incomplete',
 		'display_settings' => 'Display settings',
 		'always_show_topics' => 'Always show Topic Digests and topic feeds',
@@ -94,6 +127,13 @@ return [
 		'approve' => 'Approve',
 		'dismiss' => 'Dismiss',
 		'status' => 'Status',
+		'primary_text_provider' => 'Primary text provider',
+		'effective_text_provider' => 'Effective text provider',
+		'effective_text_provider_primary' => 'Primary',
+		'effective_text_provider_fallback' => 'Fallback',
+		'text_fallback_until' => 'Fallback active until',
+		'embedding_provider_status' => 'Embedding provider',
+		'embedding_model_status' => 'Embedding model',
 		'events' => 'Digest events',
 		'sources' => 'Matched sources',
 		'queued' => 'In queue',

@@ -6,21 +6,26 @@ define('TOPIC_DIGEST_WORKER', true);
 require_once __DIR__ . '/bootstrap.php';
 topicDigestLoadFreshRssCli();
 
-$options = getopt('', ['user:', 'batch:', 'max-runtime:']);
+$options = getopt('', ['user:', 'batch:', 'max-runtime:', 'concurrency:']);
 if (!is_array($options)) {
 	fail('Cannot parse Topic Digest daemon options.');
 }
 $username = is_string($options['user'] ?? null) ? $options['user'] : '';
 $batch = is_numeric($options['batch'] ?? null) ? (int)$options['batch'] : 20;
 $maxRuntime = is_numeric($options['max-runtime'] ?? null) ? (int)$options['max-runtime'] : 0;
-if ($username === '' || $batch < 1 || $batch > 100 || $maxRuntime < 0) {
-	fail('Usage: daemon.php --user USER [--batch 20] [--max-runtime 0]');
+$concurrencyOption = is_numeric($options['concurrency'] ?? null) ? (int)$options['concurrency'] : null;
+if ($username === '' || $batch < 1 || $batch > 100 || $maxRuntime < 0
+		|| ($concurrencyOption !== null && ($concurrencyOption < 1 || $concurrencyOption > 8))) {
+	fail('Usage: daemon.php --user USER [--batch 20] [--max-runtime 0] [--concurrency 1]');
 }
 cliInitUser($username);
 $extension = Minz_ExtensionManager::findExtension('Topic Digest');
 if (!($extension instanceof TopicDigestExtension) || !$extension->isEnabled()) {
 	fail('Topic Digest is not enabled for this user.');
 }
+// --concurrency overrides the configured worker_concurrency for this invocation only; the setting itself is
+// what launchAutomaticWorker() passes down, so this only matters for a manually-run daemon.
+$concurrency = $concurrencyOption ?? $extension->workerConcurrency();
 $lock = fopen($extension->lockPath(), 'c');
 if ($lock === false) {
 	fail('Cannot open the Topic Digest worker lock.');
@@ -53,12 +58,21 @@ try {
 		// One processor per batch, not per article: constructing it re-reads the whole configuration and the
 		// profile bookkeeping. Any configuration change alters the fingerprint below and reloads the daemon
 		// outright, so a processor never outlives the settings it was built from.
-		$processor = new TopicDigestProcessor($extension);
-		for ($index = 0; $index < $batch; $index++) {
-			$single = $processor->run(1);
+		$processor = new TopicDigestProcessor($extension, $concurrency);
+		// --batch means "up to N articles total this invocation," unchanged by concurrency: each run() call
+		// below claims one wavefront of at most $concurrency articles, and the loop steps by jobs actually
+		// claimed (not merely processed/failed — a stale job silently requeued still consumes one attempt,
+		// exactly as one for-loop iteration did before wavefronts existed) so a run of persistently-requeued
+		// jobs cannot loop past what --batch bounds. The hot-reload fingerprint check below then runs once per
+		// wavefront instead of once per article when concurrency > 1 — a deliberate, bounded coarsening (at
+		// most $concurrency articles' worth of delay), not a behavior change to what --batch bounds.
+		$claimedInBatch = 0;
+		while ($claimedInBatch < $batch) {
+			$single = $processor->run(min($concurrency, $batch - $claimedInBatch));
 			$result['processed'] += $single['processed'];
 			$result['failed'] += $single['failed'];
 			$result['backfill_scanned'] += $single['backfill_scanned'];
+			$claimedInBatch += $single['claimed'];
 			if (!hash_equals($startingFingerprint, $fingerprint())) {
 				$reload = true;
 				break;
@@ -103,6 +117,9 @@ if ($reload && function_exists('exec')) {
 		. ' --user ' . escapeshellarg($username)
 		. ' --batch ' . escapeshellarg((string)$batch)
 		. ' --max-runtime ' . escapeshellarg((string)$remainingRuntime)
+		// Re-reads the freshly-changed configuration on restart rather than re-passing the option this
+		// process happened to start with, unless the option was explicitly given on the command line.
+		. ($concurrencyOption !== null ? ' --concurrency ' . escapeshellarg((string)$concurrencyOption) : '')
 		. ' >> ' . escapeshellarg($logPath) . ' 2>&1 < /dev/null &';
 	$output = [];
 	$resultCode = 0;

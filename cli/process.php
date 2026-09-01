@@ -6,11 +6,13 @@ define('TOPIC_DIGEST_WORKER', true);
 require_once __DIR__ . '/bootstrap.php';
 topicDigestLoadFreshRssCli();
 
-$options = getopt('', ['user:', 'limit:']);
+$options = getopt('', ['user:', 'limit:', 'concurrency:']);
 $username = is_string($options['user'] ?? null) ? $options['user'] : '';
 $limit = is_numeric($options['limit'] ?? null) ? (int)$options['limit'] : 20;
-if ($username === '' || $limit < 1 || $limit > 1000) {
-	fail('Usage: process.php --user USER [--limit 20]');
+$concurrencyOption = is_numeric($options['concurrency'] ?? null) ? (int)$options['concurrency'] : null;
+if ($username === '' || $limit < 1 || $limit > 1000
+		|| ($concurrencyOption !== null && ($concurrencyOption < 1 || $concurrencyOption > 8))) {
+	fail('Usage: process.php --user USER [--limit 20] [--concurrency 1]');
 }
 cliInitUser($username);
 $extension = Minz_ExtensionManager::findExtension('Topic Digest');
@@ -22,7 +24,7 @@ if ($lock === false || !flock($lock, LOCK_EX | LOCK_NB)) {
 	fail('Topic Digest worker is already running or cannot acquire its lock.');
 }
 try {
-	$result = (new TopicDigestProcessor($extension))->run($limit);
+	$result = (new TopicDigestProcessor($extension, $concurrencyOption))->run($limit);
 	echo 'Topic Digest processed ', $result['processed'], ' jobs; ', $result['failed'],
 		' failed; scanned ', $result['backfill_scanned'], " archive entries.\n";
 } catch (Throwable $e) {

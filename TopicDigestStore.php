@@ -1155,6 +1155,35 @@ final class TopicDigestStore {
 	}
 
 	/**
+	 * Generalized counterpart to cloudUnavailableUntil()/markCloudUnavailable(), used only when the
+	 * configured text-provider fallback is not the legacy implicit "cloud falls back to local" pairing
+	 * (e.g. an OpenAI-compatible fallback). Kept as a separate meta key so the legacy pairing's own
+	 * cooldown tracking (and its existing test coverage) is untouched.
+	 */
+	public function primaryTextFallbackUntil(): int {
+		return (int)($this->getMeta('primary_text_fallback_until') ?? 0);
+	}
+
+	public function markPrimaryTextFallback(int $untilTimestamp): void {
+		$this->setMeta('primary_text_fallback_until', (string)$untilTimestamp);
+	}
+
+	/**
+	 * Tracks the embedding provider identity (type+URL+model) last seen configured, so
+	 * TopicDigestExtension can invalidate stored embeddings exactly when that identity changes —
+	 * independent of any text-provider setting, now that text and embeddings are separately configured.
+	 * Deliberately not the analysis_hash column: embedding identity governs topics.description_embedding
+	 * and events.embedding too, neither of which is gated by that column.
+	 */
+	public function lastEmbeddingIdentity(): ?string {
+		return $this->getMeta('embedding_identity');
+	}
+
+	public function setLastEmbeddingIdentity(string $identity): void {
+		$this->setMeta('embedding_identity', $identity);
+	}
+
+	/**
 	 * Tracks the profile the user last had *configured*, so changing it invalidates embeddings computed under the
 	 * previous one. Deliberately not the effective profile: the automatic cloud->local fallback flips by itself
 	 * every cooldown, and invalidating on those flips just recomputed every embedding over and over.

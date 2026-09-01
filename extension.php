@@ -3,21 +3,49 @@ declare(strict_types=1);
 
 require_once __DIR__ . '/TopicDigestStore.php';
 require_once __DIR__ . '/ArticleSummaryCache.php';
+require_once __DIR__ . '/TopicDigestTextProvider.php';
 require_once __DIR__ . '/TopicDigestOllama.php';
+require_once __DIR__ . '/TopicDigestOpenAICompatible.php';
+require_once __DIR__ . '/TopicDigestTextProviderChain.php';
+require_once __DIR__ . '/TopicDigestParallelTester.php';
+require_once __DIR__ . '/TopicDigestConcurrentDispatcher.php';
 require_once __DIR__ . '/TopicDigestScraper.php';
 require_once __DIR__ . '/TopicDigestProcessor.php';
 
 /**
  * @phpstan-type TopicDigestConfig array{ollama_profile:string,effective_ollama_profile:string,ollama_url:string,
  *  summary_model:string,judge_model:string,embedding_model:string,structuring_model:string,timeout:int,scraping:bool,
- *  always_show_topics:bool}
+ *  always_show_topics:bool,fallback_text_mode:string,fallback_text_type:?string,fallback_text_url:?string,
+ *  fallback_text_summary_model:?string,fallback_text_judge_model:?string,embedding_provider_url:string,
+ *  embedding_provider_model:string,openai_base_url:string,openai_summary_model:string,openai_judge_model:string,
+ *  worker_concurrency:int}
  */
 final class TopicDigestExtension extends Minz_Extension {
 	private const CATEGORY_NAME = 'Topic Digests';
 	private const DEFAULT_OLLAMA_TIMEOUT = 1800;
 	private const LEGACY_OLLAMA_TIMEOUT = 180;
 	private const MAX_OLLAMA_TIMEOUT = 7200;
+	/**
+	 * How many articles' inference may run concurrently. Deliberately conservative: this bounds real,
+	 * simultaneous outbound HTTP requests to whatever text/embedding provider is configured, not just a
+	 * local resource. Default 1 reproduces the original, fully sequential worker exactly.
+	 */
+	private const MAX_WORKER_CONCURRENCY = 8;
 	private const OLLAMA_PROFILES = ['local', 'cloud'];
+	/**
+	 * The primary *text* provider: "local"/"cloud" are the original Ollama profiles (unchanged meaning);
+	 * "openai_compatible" is new and uses the configured OpenAI-compatible endpoint directly as the
+	 * primary, not just as a fallback. Stored under the same "ollama_profile" key as before for full
+	 * backward compatibility (an existing "local"/"cloud" value keeps meaning exactly what it always did).
+	 */
+	private const PRIMARY_PROVIDER_TYPES = ['local', 'cloud', 'openai_compatible'];
+	/**
+	 * How the fallback *text* provider is chosen once the primary hits an account/plan limit (HTTP 402/429):
+	 * "local" is the default and reproduces the original, implicit Ollama Cloud -> local Ollama pairing
+	 * byte-for-byte when the primary is "cloud" (generalized to any non-local primary); "openai_compatible"
+	 * routes to the configured OpenAI-compatible endpoint instead; "none" disables fallback entirely.
+	 */
+	private const FALLBACK_TEXT_MODES = ['local', 'openai_compatible', 'none'];
 	/** @var array<string,string> */
 	private const OLLAMA_PROFILE_DEFAULTS = ['ollama_url' => 'http://ollama:11434', 'summary_model' => 'qwen3.5:4b',
 		'judge_model' => 'qwen3.5:9b', 'embedding_model' => 'qwen3-embedding:0.6b'];
@@ -149,6 +177,8 @@ final class TopicDigestExtension extends Minz_Extension {
 	/** @return TopicDigestConfig */
 	public function configuration(): array {
 		$profile = $this->effectiveOllamaProfile();
+		$fallback = $this->fallbackTextIdentity();
+		$embedding = $this->embeddingConfiguration();
 		return [
 			'ollama_profile' => $this->storedOllamaProfile(),
 			'effective_ollama_profile' => $profile,
@@ -160,26 +190,51 @@ final class TopicDigestExtension extends Minz_Extension {
 			'timeout' => $this->ollamaTimeoutConfiguration(),
 			'scraping' => $this->getUserConfigurationBool('scraping') ?? true,
 			'always_show_topics' => $this->getUserConfigurationBool('always_show_topics') ?? true,
+			'fallback_text_mode' => $this->fallbackTextMode(),
+			'fallback_text_type' => $fallback['type'] ?? null,
+			'fallback_text_url' => $fallback['url'] ?? null,
+			'fallback_text_summary_model' => $fallback['summary_model'] ?? null,
+			'fallback_text_judge_model' => $fallback['judge_model'] ?? null,
+			'embedding_provider_url' => $embedding['url'],
+			'embedding_provider_model' => $embedding['model'],
+			// The shared OpenAI-compatible field set, usable as the primary and/or the fallback. Never the API key.
+			'openai_base_url' => $this->openAiCompatibleConfiguration()['base_url'],
+			'openai_summary_model' => $this->openAiCompatibleConfiguration()['summary_model'],
+			'openai_judge_model' => $this->openAiCompatibleConfiguration()['judge_model'],
+			'worker_concurrency' => $this->workerConcurrency(),
 		];
 	}
 
-	/** The user's saved preference, as shown/edited on the settings page. */
-	private function storedOllamaProfile(): string {
-		$profile = $this->getUserConfigurationString('ollama_profile') ?? 'local';
-		return in_array($profile, self::OLLAMA_PROFILES, true) ? $profile : 'local';
+	/** How many articles' inference may run concurrently; 1 (fully sequential, the original behaviour) by default. */
+	public function workerConcurrency(): int {
+		$concurrency = $this->getUserConfigurationInt('worker_concurrency');
+		if ($concurrency === null) {
+			return 1;
+		}
+		return min(self::MAX_WORKER_CONCURRENCY, max(1, $concurrency));
 	}
 
 	/**
-	 * The profile actually used for processing: the stored preference, unless it is "cloud" and Ollama Cloud
-	 * most recently rejected a request for account/plan reasons (HTTP 402/429), in which case "local" is used
-	 * automatically until the cooldown set by TopicDigestProcessor expires.
+	 * The user's saved primary-text-provider preference, as shown/edited on the settings page: "local" or
+	 * "cloud" (the original two Ollama profiles) or "openai_compatible".
+	 */
+	private function storedOllamaProfile(): string {
+		$profile = $this->getUserConfigurationString('ollama_profile') ?? 'local';
+		return in_array($profile, self::PRIMARY_PROVIDER_TYPES, true) ? $profile : 'local';
+	}
+
+	/**
+	 * The Ollama profile actually used for processing when the primary is Ollama-based: the stored
+	 * preference, unless it is "cloud" and Ollama Cloud most recently rejected a request for account/plan
+	 * reasons (HTTP 402/429), in which case "local" is used automatically until the cooldown set by
+	 * TopicDigestProcessor expires. Meaningless (and unused) while the primary is "openai_compatible".
 	 */
 	private function effectiveOllamaProfile(): string {
 		$stored = $this->storedOllamaProfile();
 		if ($stored === 'cloud' && $this->store()->cloudUnavailableUntil() > time()) {
 			return 'local';
 		}
-		return $stored;
+		return $stored === 'openai_compatible' ? 'local' : $stored;
 	}
 
 	/** Unix timestamp until which processing is automatically using the local profile, or 0 if not in fallback. */
@@ -228,6 +283,197 @@ final class TopicDigestExtension extends Minz_Extension {
 		return $result;
 	}
 
+	/** The user's saved fallback-text-provider preference, as shown/edited on the settings page. */
+	public function fallbackTextMode(): string {
+		$mode = $this->getUserConfigurationString('fallback_text_mode') ?? 'local';
+		return in_array($mode, self::FALLBACK_TEXT_MODES, true) ? $mode : 'local';
+	}
+
+	/** @return array{base_url:string,api_key:string,summary_model:string,judge_model:string} */
+	private function openAiCompatibleConfiguration(): array {
+		return [
+			'base_url' => rtrim($this->getUserConfigurationString('openai_base_url') ?? '', '/'),
+			'api_key' => $this->getUserConfigurationString('openai_api_key') ?? '',
+			'summary_model' => trim($this->getUserConfigurationString('openai_summary_model') ?? ''),
+			'judge_model' => trim($this->getUserConfigurationString('openai_judge_model') ?? ''),
+		];
+	}
+
+	/** Whether an OpenAI-compatible API key has already been saved (never the key itself). */
+	public function hasOpenAiApiKey(): bool {
+		return ($this->getUserConfigurationString('openai_api_key') ?? '') !== '';
+	}
+
+	/**
+	 * The primary text provider's identity: "local"/"cloud" resolve to that Ollama profile's fields;
+	 * "openai_compatible" resolves to the (shared) OpenAI-compatible field set. Kept separate from the
+	 * *effective* profile so that an automatic quota-driven fallback never changes it.
+	 * @return array{type:string,url:string,summary_model:string,judge_model:string}
+	 */
+	private function primaryTextIdentity(): array {
+		$profile = $this->storedOllamaProfile();
+		if ($profile === 'openai_compatible') {
+			$config = $this->openAiCompatibleConfiguration();
+			return ['type' => 'openai-compatible', 'url' => $config['base_url'],
+				'summary_model' => $config['summary_model'], 'judge_model' => $config['judge_model']];
+		}
+		return ['type' => 'ollama', 'url' => $this->ollamaProfileValue($profile, 'ollama_url'),
+			'summary_model' => $this->ollamaProfileValue($profile, 'summary_model'),
+			'judge_model' => $this->ollamaProfileValue($profile, 'judge_model')];
+	}
+
+	/**
+	 * The fallback text provider's identity, excluding its API key, or null while no fallback is
+	 * configured/usable. "local" mode (the default) reproduces the exact pre-existing Ollama Cloud ->
+	 * local Ollama pairing, generalized to any non-local primary (a "local" primary has nothing to fall
+	 * back to, exactly as before this setting existed). Note that "openai_compatible" as both the primary
+	 * and the fallback shares one field set, so that combination is a harmless no-op fallback, not two
+	 * independent OpenAI-compatible endpoints — a deliberate v1 simplification.
+	 * @return array{type:string,url:string,summary_model:string,judge_model:string}|null
+	 */
+	private function fallbackTextIdentity(): ?array {
+		if ($this->fallbackTextMode() === 'local') {
+			if ($this->storedOllamaProfile() === 'local') {
+				return null;
+			}
+			return ['type' => 'ollama', 'url' => $this->ollamaProfileValue('local', 'ollama_url'),
+				'summary_model' => $this->ollamaProfileValue('local', 'summary_model'),
+				'judge_model' => $this->ollamaProfileValue('local', 'judge_model')];
+		}
+		if ($this->fallbackTextMode() === 'openai_compatible') {
+			$config = $this->openAiCompatibleConfiguration();
+			if ($config['base_url'] === '' || $config['summary_model'] === '' || $config['judge_model'] === '') {
+				return null;
+			}
+			return ['type' => 'openai-compatible', 'url' => $config['base_url'],
+				'summary_model' => $config['summary_model'], 'judge_model' => $config['judge_model']];
+		}
+		return null;
+	}
+
+	/**
+	 * The embedding provider, fully decoupled from whichever text provider is in use. Defaults (while the
+	 * dedicated setting has never been saved) to whatever this install's *stored* text profile already used
+	 * for embeddings before this decoupling existed, so nothing changes for an existing install until it
+	 * explicitly edits the new "Embedding provider" settings field.
+	 * @return array{url:string,model:string}
+	 */
+	private function embeddingConfiguration(): array {
+		// ollamaProfileValue() only has a built-in default for "local" (and "cloud" only once the user has
+		// actually saved cloud fields); a stored primary of "openai_compatible" has no Ollama fields of its own
+		// to fall back to at all, so the sensible default source is always "local" in that case.
+		$profile = $this->storedOllamaProfile();
+		$defaultProfile = $profile === 'openai_compatible' ? 'local' : $profile;
+		$url = $this->getUserConfigurationString('embedding_ollama_url');
+		$model = $this->getUserConfigurationString('embedding_provider_model');
+		return [
+			'url' => $url !== null && $url !== '' ? rtrim($url, '/') : $this->ollamaProfileValue($defaultProfile, 'ollama_url'),
+			'model' => $model !== null && $model !== '' ? $model : $this->ollamaProfileValue($defaultProfile, 'embedding_model'),
+		];
+	}
+
+	/** @return array{type:string,url:string,model:string} */
+	private function embeddingIdentity(): array {
+		$config = $this->embeddingConfiguration();
+		return ['type' => 'ollama', 'url' => $config['url'], 'model' => $config['model']];
+	}
+
+	/** A stable identity string for TopicDigestStore::lastEmbeddingIdentity()'s change detection. */
+	public function embeddingIdentityHash(): string {
+		return hash('sha256', json_encode($this->embeddingIdentity(), JSON_THROW_ON_ERROR));
+	}
+
+	/**
+	 * Whether the primary text provider is currently being skipped in favour of the fallback: the stored
+	 * preference is untouched either way (see textProviderChain()/markPrimaryTextUnavailable()).
+	 */
+	public function primaryTextInCooldown(): bool {
+		return match ($this->fallbackTextMode()) {
+			'local' => $this->storedOllamaProfile() === 'cloud' && $this->store()->cloudUnavailableUntil() > time(),
+			'openai_compatible' => $this->store()->primaryTextFallbackUntil() > time(),
+			default => false,
+		};
+	}
+
+	/** Unix timestamp until which processing is automatically using the fallback text provider, or 0. */
+	public function textFallbackUntil(): int {
+		if (!$this->primaryTextInCooldown()) {
+			return 0;
+		}
+		return match ($this->fallbackTextMode()) {
+			'local' => $this->store()->cloudUnavailableUntil(),
+			'openai_compatible' => $this->store()->primaryTextFallbackUntil(),
+			default => 0,
+		};
+	}
+
+	/** Records that the primary text provider just rejected a request for account/plan reasons. */
+	public function markPrimaryTextUnavailable(int $untilTimestamp): void {
+		match ($this->fallbackTextMode()) {
+			'local' => $this->store()->markCloudUnavailable($untilTimestamp),
+			'openai_compatible' => $this->store()->markPrimaryTextFallback($untilTimestamp),
+			default => null,
+		};
+	}
+
+	/**
+	 * Builds the primary text provider, bound to the *stored* (not effective) profile. $transportSource, when
+	 * given, routes requests through it instead of real blocking curl — either the settings-page's
+	 * TopicDigestParallelTester (a fast, concurrent "Test connection" check) or the worker's
+	 * TopicDigestConcurrentDispatcher (real concurrent inference for one wavefront of claimed jobs).
+	 */
+	public function buildPrimaryTextProvider(int $timeout, ?TopicDigestTransportSource $transportSource = null): TopicDigestTextProvider {
+		$identity = $this->primaryTextIdentity();
+		if ($identity['type'] === 'openai-compatible') {
+			$config = $this->openAiCompatibleConfiguration();
+			return new TopicDigestOpenAICompatible($config['base_url'], $config['api_key'], $timeout,
+				$transportSource?->openAiTransport(),
+				structuringUrl: $this->ollamaProfileValue('local', 'ollama_url'), structuringModel: $this->structuringModel());
+		}
+		return new TopicDigestOllama($identity['url'], $timeout, $transportSource?->ollamaTransport($identity['url']),
+			structuringUrl: $this->ollamaProfileValue('local', 'ollama_url'), structuringModel: $this->structuringModel());
+	}
+
+	/** Builds the fallback text provider, or null while none is configured/usable. Never exposes the API key. */
+	public function buildFallbackTextProvider(int $timeout, ?TopicDigestTransportSource $transportSource = null): ?TopicDigestTextProvider {
+		if ($this->fallbackTextIdentity() === null) {
+			return null;
+		}
+		if ($this->fallbackTextMode() === 'local') {
+			$url = $this->ollamaProfileValue('local', 'ollama_url');
+			return new TopicDigestOllama($url, $timeout, $transportSource?->ollamaTransport($url),
+				structuringUrl: $url, structuringModel: $this->structuringModel());
+		}
+		$config = $this->openAiCompatibleConfiguration();
+		return new TopicDigestOpenAICompatible($config['base_url'], $config['api_key'], $timeout,
+			$transportSource?->openAiTransport(),
+			structuringUrl: $this->ollamaProfileValue('local', 'ollama_url'), structuringModel: $this->structuringModel());
+	}
+
+	/** Builds the embedding provider: always local-Ollama-compatible, fully decoupled from the text provider(s). */
+	public function buildEmbeddingProvider(int $timeout, ?TopicDigestTransportSource $transportSource = null): TopicDigestEmbeddingProvider {
+		$config = $this->embeddingConfiguration();
+		return new TopicDigestOllama($config['url'], $timeout, $transportSource?->ollamaTransport($config['url']));
+	}
+
+	/**
+	 * Assembles the primary+fallback text providers into one chain. $transportSource, when given, routes every
+	 * provider built here through it (see buildPrimaryTextProvider()) — used to build a wavefront-scoped chain
+	 * for TopicDigestProcessor's concurrent prepare() stage; omitted, this builds the real-blocking-curl chain
+	 * used everywhere else (unchanged from before concurrency support existed).
+	 */
+	public function textProviderChain(int $timeout, ?TopicDigestTransportSource $transportSource = null): TopicDigestTextProviderChain {
+		$primaryIdentity = $this->primaryTextIdentity();
+		$fallbackIdentity = $this->fallbackTextIdentity();
+		return new TopicDigestTextProviderChain(
+			$this->buildPrimaryTextProvider($timeout, $transportSource), $primaryIdentity['summary_model'], $primaryIdentity['judge_model'],
+			$primaryIdentity['type'],
+			$this->buildFallbackTextProvider($timeout, $transportSource), $fallbackIdentity['summary_model'] ?? null,
+			$fallbackIdentity['judge_model'] ?? null, $fallbackIdentity['type'] ?? null,
+			$this->primaryTextInCooldown(),
+		);
+	}
+
 	private function ollamaTimeoutConfiguration(): int {
 		$timeout = $this->getUserConfigurationInt('timeout');
 		if ($timeout === null || $timeout === self::LEGACY_OLLAMA_TIMEOUT) {
@@ -237,18 +483,27 @@ final class TopicDigestExtension extends Minz_Extension {
 	}
 
 	/**
-	 * The models the user has actually configured, ignoring any temporary automatic cloud->local fallback.
+	 * Whether none of the new multi-provider settings are actually in use (primary still local/cloud,
+	 * fallback still at its "local" default, embedding fields never explicitly saved). When true,
+	 * pipelineHash()/analysisHash() below reproduce the exact pre-existing hash formula (bare model-name
+	 * strings, no type/url wrapper) byte-for-byte.
 	 *
-	 * pipelineHash()/analysisHash() must be derived from these, never from the *effective* profile: the automatic
-	 * fallback flips back and forth on its own every cooldown, and hashing the effective profile made every one of
-	 * those flips invalidate the stored hash of every queued job at once. Each job then took the "pipeline changed"
-	 * branch, re-queued itself and did no classification at all, so with a backlog larger than one cooldown's worth
-	 * of work the queue could never converge: it churned quickly (no Ollama call on that branch) while matching
-	 * nothing, and every summary and embedding was recomputed on each flip.
-	 *
-	 * @return array{summary_model:string,judge_model:string,embedding_model:string}
+	 * This matters because upgrading otherwise changed the hash's *shape* even for installs that never
+	 * touched anything new — the richer identity tuples hash to different bytes than the old bare strings
+	 * even when the underlying values are identical — which forced a one-time full backlog reclassification
+	 * (and, since analysisHash() also changed shape, a full summary/embedding recompute) with no real
+	 * configuration change behind it. The moment a user actually saves a new-feature setting, save_settings()
+	 * already triggers a backfill unconditionally, so switching formulas exactly then costs nothing extra.
 	 */
-	private function storedProfileModels(): array {
+	private function usesOnlyLegacyProviderConfiguration(): bool {
+		return $this->storedOllamaProfile() !== 'openai_compatible'
+			&& $this->fallbackTextMode() === 'local'
+			&& $this->getUserConfigurationString('embedding_ollama_url') === null
+			&& $this->getUserConfigurationString('embedding_provider_model') === null;
+	}
+
+	/** @return array{summary_model:string,judge_model:string,embedding_model:string} */
+	private function legacyProfileModels(): array {
 		$profile = $this->storedOllamaProfile();
 		return [
 			'summary_model' => $this->ollamaProfileValue($profile, 'summary_model'),
@@ -257,22 +512,62 @@ final class TopicDigestExtension extends Minz_Extension {
 		];
 	}
 
+	/**
+	 * Derived only from the *configured* provider chain (primary identity, fallback identity when enabled,
+	 * embedding identity) — never from which one happens to be *effectively* active right now. The automatic
+	 * quota-driven fallback flips back and forth on its own every cooldown, and hashing the effective
+	 * provider made every one of those flips invalidate the stored hash of every queued job at once. Each job
+	 * then took the "pipeline changed" branch, re-queued itself and did no classification at all, so with a
+	 * backlog larger than one cooldown's worth of work the queue could never converge: it churned quickly (no
+	 * inference call on that branch) while matching nothing, and every summary and embedding was recomputed
+	 * on each flip. Editing the primary *or* the fallback's summary/embedding model in settings still changes
+	 * this hash (as it always did for the single profile), which is the correct, existing "requeue for
+	 * reclassification" trigger — it is only the automatic runtime flip that must never do so.
+	 *
+	 * The judge model is deliberately excluded: this hash gates rebuildDigests()/prepareRebuildJobs(), which
+	 * unmatches every already-matched article and re-queues the whole backlog — a disruptive, visible restart.
+	 * Topic/event decisions already have their own cache keyed on judgeModelIdentity() (see
+	 * TopicDigestProcessor::topicDecisions()/eventDecisions()), so a judge-model change already gets a fresh
+	 * decision wherever one is actually needed, without forcing every prior decision to be redone. Trying a new
+	 * judge model against already-matched articles is a deliberate action the user can take with a manual
+	 * restart, not something an unrelated settings save should force on them.
+	 */
 	public function pipelineHash(): string {
-		$models = $this->storedProfileModels();
 		$scraping = $this->getUserConfigurationBool('scraping') ?? true;
 		$topics = array_map(static fn(array $topic): array => [
 			$topic['id'], $topic['rule_hash'], $topic['enabled'], $topic['all_feeds'], $topic['all_categories'],
 			$topic['feed_ids'], $topic['category_ids'], $topic['backfill_mode'], $topic['backfill_days'], $topic['topic_type'],
 			$topic['show_verification'],
 		], $this->store()->topics());
-		return hash('sha256', json_encode([$models['summary_model'], $models['judge_model'],
-			$models['embedding_model'], $scraping, $this->store()->pipelineRevision(), $topics], JSON_THROW_ON_ERROR));
+		if ($this->usesOnlyLegacyProviderConfiguration()) {
+			$models = $this->legacyProfileModels();
+			return hash('sha256', json_encode([$models['summary_model'],
+				$models['embedding_model'], $scraping, $this->store()->pipelineRevision(), $topics], JSON_THROW_ON_ERROR));
+		}
+		$primary = $this->primaryTextIdentity();
+		$fallback = $this->fallbackTextIdentity();
+		$embedding = $this->embeddingIdentity();
+		return hash('sha256', json_encode([
+			['type' => $primary['type'], 'url' => $primary['url'], 'summary_model' => $primary['summary_model']],
+			$fallback === null ? null
+				: ['type' => $fallback['type'], 'url' => $fallback['url'], 'summary_model' => $fallback['summary_model']],
+			$embedding, $scraping, $this->store()->pipelineRevision(), $topics,
+		], JSON_THROW_ON_ERROR));
 	}
 
 	public function analysisHash(): string {
-		$models = $this->storedProfileModels();
-		return hash('sha256', json_encode([$models['summary_model'], $models['embedding_model'],
-			$this->getUserConfigurationBool('scraping') ?? true], JSON_THROW_ON_ERROR));
+		if ($this->usesOnlyLegacyProviderConfiguration()) {
+			$models = $this->legacyProfileModels();
+			return hash('sha256', json_encode([$models['summary_model'], $models['embedding_model'],
+				$this->getUserConfigurationBool('scraping') ?? true], JSON_THROW_ON_ERROR));
+		}
+		$primary = $this->primaryTextIdentity();
+		$fallback = $this->fallbackTextIdentity();
+		return hash('sha256', json_encode([
+			['type' => $primary['type'], 'url' => $primary['url'], 'model' => $primary['summary_model']],
+			$fallback === null ? null : ['type' => $fallback['type'], 'url' => $fallback['url'], 'model' => $fallback['summary_model']],
+			$this->embeddingIdentity(), $this->getUserConfigurationBool('scraping') ?? true,
+		], JSON_THROW_ON_ERROR));
 	}
 
 	public function lockPath(): string {
@@ -458,7 +753,16 @@ final class TopicDigestExtension extends Minz_Extension {
 			return 0;
 		}
 		$cursor = $lastId === null ? $backfill['cursor'] : self::previousNumericString($lastId);
-		$this->store()->advanceBackfill($cursor, $count === $limit);
+		// A page returning fewer than $limit rows is not proof there is nothing older left to scan: FreshRSS
+		// prunes/archives old entries over time, so a page can land in a range where many ids in between are
+		// gone, making this page short while plenty of real, older entries still exist further down. Treating
+		// a short page as "reached the end" (the previous `$count === $limit` check) stopped the scan there
+		// for good — nothing re-activates it afterwards except a full startBackfill() reset, which used to
+		// happen as an (unrelated, buggy) side effect of every settings save and so masked this by effectively
+		// retrying the whole scan from the top on a schedule. Now that saves only reset it when something
+		// pipelineHash-relevant actually changed, a short page must keep the scan going by itself. Only a
+		// genuinely empty page (handled above) means there is nothing left below the cursor.
+		$this->store()->advanceBackfill($cursor, true);
 		return $count;
 	}
 
@@ -1016,6 +1320,14 @@ final class TopicDigestExtension extends Minz_Extension {
 			return;
 		}
 		if ($entry->isRead()) {
+			// $suppressManualUnreadTracking is a single instance property shared by every job this extension
+			// instance ever processes. Under worker concurrency, several jobs' finalize() calls run one after
+			// another (never concurrently with each other), but a *prepare()* call for a different job could
+			// still be suspended mid-flight (awaiting a provider response) while this code runs. That is safe
+			// only because nothing between setting and clearing this flag ever calls Fiber::suspend() (no HTTP
+			// call happens here) — PHP Fibers are cooperative, so this whole block always runs to completion
+			// before any other fiber gets a turn. Do not add an HTTP/provider call inside this try block without
+			// re-examining that invariant.
 			$this->suppressManualUnreadTracking = true;
 			try {
 				if (FreshRSS_Factory::createEntryDao()->markRead($entry->id(), false) === false) {
@@ -1167,11 +1479,17 @@ final class TopicDigestExtension extends Minz_Extension {
 			}
 		} elseif ($action === 'save_settings') {
 			$previousConfig = $this->configuration();
+			$previousEmbeddingIdentity = $this->embeddingIdentityHash();
+			$previousPipelineHash = $this->pipelineHash();
 			$profile = Minz_Request::paramString('ollama_profile', plaintext: true);
-			if (!in_array($profile, self::OLLAMA_PROFILES, true)) {
-				Minz_Request::bad('Invalid Ollama profile.');
+			if (!in_array($profile, self::PRIMARY_PROVIDER_TYPES, true)) {
+				Minz_Request::bad('Invalid primary text provider.');
 			}
-			$values = ['ollama_profile' => $profile];
+			$fallbackMode = Minz_Request::paramString('fallback_text_mode', plaintext: true);
+			if (!in_array($fallbackMode, self::FALLBACK_TEXT_MODES, true)) {
+				Minz_Request::bad('Invalid fallback text provider.');
+			}
+			$values = ['ollama_profile' => $profile, 'fallback_text_mode' => $fallbackMode];
 			foreach (self::OLLAMA_PROFILES as $key) {
 				$url = rtrim(Minz_Request::paramString("{$key}_ollama_url", plaintext: true), '/');
 				$models = [Minz_Request::paramString("{$key}_summary_model", plaintext: true),
@@ -1187,6 +1505,36 @@ final class TopicDigestExtension extends Minz_Extension {
 				$values["{$key}_judge_model"] = trim($models[1]);
 				$values["{$key}_embedding_model"] = trim($models[2]);
 			}
+			// A blank API key field means "leave the saved key unchanged" (the field is never pre-filled with the
+			// real key, so a blank submission cannot mean "the user wants an empty key"); the checkbox is the only
+			// way to actually clear it. Never logged, never echoed back, never included in any exception message.
+			$existingApiKey = $this->getUserConfigurationString('openai_api_key') ?? '';
+			$submittedApiKey = trim(Minz_Request::paramString('openai_api_key', plaintext: true));
+			$clearApiKey = Minz_Request::paramBoolean('openai_api_key_clear');
+			$apiKey = $clearApiKey ? '' : ($submittedApiKey !== '' ? $submittedApiKey : $existingApiKey);
+			$openAiBaseUrl = rtrim(Minz_Request::paramString('openai_base_url', plaintext: true), '/');
+			$openAiSummaryModel = trim(Minz_Request::paramString('openai_summary_model', plaintext: true));
+			$openAiJudgeModel = trim(Minz_Request::paramString('openai_judge_model', plaintext: true));
+			$openAiNeeded = $profile === 'openai_compatible' || $fallbackMode === 'openai_compatible';
+			$openAiBlank = $openAiBaseUrl === '' && $openAiSummaryModel === '' && $openAiJudgeModel === '' && $apiKey === '';
+			if (($openAiNeeded || !$openAiBlank) && (!$this->validOllamaUrl($openAiBaseUrl)
+					|| !$this->validModelName($openAiSummaryModel) || !$this->validModelName($openAiJudgeModel))) {
+				Minz_Request::bad('Invalid OpenAI-compatible base URL or model name.');
+			}
+			if ($openAiNeeded && $apiKey === '') {
+				Minz_Request::bad('An OpenAI-compatible API key is required.');
+			}
+			$values['openai_base_url'] = $openAiBaseUrl;
+			$values['openai_api_key'] = $apiKey;
+			$values['openai_summary_model'] = $openAiSummaryModel;
+			$values['openai_judge_model'] = $openAiJudgeModel;
+			$embeddingUrl = rtrim(Minz_Request::paramString('embedding_ollama_url', plaintext: true), '/');
+			$embeddingModel = trim(Minz_Request::paramString('embedding_provider_model', plaintext: true));
+			if (!$this->validOllamaUrl($embeddingUrl) || !$this->validModelName($embeddingModel)) {
+				Minz_Request::bad('Invalid embedding provider URL or model name.');
+			}
+			$values['embedding_ollama_url'] = $embeddingUrl;
+			$values['embedding_provider_model'] = $embeddingModel;
 			$structuringModel = trim(Minz_Request::paramString('structuring_model', plaintext: true));
 			if ($structuringModel !== '' && !$this->validModelName($structuringModel)) {
 				Minz_Request::bad('Invalid structuring model name.');
@@ -1194,17 +1542,31 @@ final class TopicDigestExtension extends Minz_Extension {
 			/** @phpstan-ignore method.deprecated */
 			$this->setUserConfiguration([...$values, 'structuring_model' => $structuringModel,
 				'timeout' => min(self::MAX_OLLAMA_TIMEOUT, max(10, Minz_Request::paramInt('timeout'))),
+				'worker_concurrency' => min(self::MAX_WORKER_CONCURRENCY, max(1, Minz_Request::paramInt('worker_concurrency'))),
 				'scraping' => Minz_Request::paramBoolean('scraping'),
 				'always_show_topics' => $previousConfig['always_show_topics']]);
-			if (!hash_equals($previousConfig['embedding_model'], $values["{$profile}_embedding_model"])) {
+			if ($this->embeddingIdentityHash() !== $previousEmbeddingIdentity) {
 				$this->store()->invalidateEmbeddings();
+				$this->store()->setLastEmbeddingIdentity($this->embeddingIdentityHash());
 			}
-			$this->store()->startBackfill();
+			// startBackfill() bumps pipeline_revision, which pipelineHash() itself hashes — calling it
+			// unconditionally would change pipelineHash()'s output (and so reset the whole backlog to pending
+			// via enqueue()'s stale-hash check) on every save, regardless of whether anything hash-relevant
+			// actually changed. This defeated, in particular, judge-model-only changes being excluded from
+			// pipelineHash() on purpose: saving with a new judge model but nothing else still triggered a full
+			// reclassification through this side effect alone. Comparing pipelineHash() computed before/after
+			// (call site already at the top of this action, and read again here before any revision bump can
+			// have happened) restricts the backfill to saves that actually change something pipelineHash() cares
+			// about — the same pattern News Deduplicator's equivalent save action already used correctly.
+			if (!hash_equals($previousPipelineHash, $this->pipelineHash())) {
+				$this->store()->startBackfill();
+			}
 			Minz_Request::good(_t('feedback.conf.updated'), $this->settingsRedirect());
 		} elseif ($action === 'save_display_settings') {
 			$this->setUserConfigurationValue('always_show_topics', Minz_Request::paramBoolean('always_show_topics'));
 			Minz_Request::good(_t('feedback.conf.updated'), $this->settingsRedirect());
 		} elseif ($action === 'save_topic') {
+			$previousPipelineHash = $this->pipelineHash();
 			$id = Minz_Request::paramInt('topic_id');
 			$values = [
 				'name' => Minz_Request::paramString('name', plaintext: true),
@@ -1219,7 +1581,13 @@ final class TopicDigestExtension extends Minz_Extension {
 				'show_verification' => Minz_Request::paramBoolean('show_verification'),
 			];
 			$topicId = $this->store()->saveTopic($values, $id > 0 ? $id : null);
-			$this->store()->startBackfill();
+			// Same reasoning as save_settings above: startBackfill() bumps pipeline_revision, which
+			// pipelineHash() hashes, so calling it unconditionally would reset the whole backlog on every save
+			// regardless of whether anything pipelineHash() actually cares about changed (e.g. adjusting only
+			// this topic's confidence threshold, which isn't part of the hashed topic tuple).
+			if (!hash_equals($previousPipelineHash, $this->pipelineHash())) {
+				$this->store()->startBackfill();
+			}
 			$this->syntheticFeedIds = null;
 			$this->synchroniseTopic($topicId, false);
 			Minz_Request::good(_t('feedback.conf.updated'), $this->settingsRedirect());
@@ -1298,14 +1666,52 @@ final class TopicDigestExtension extends Minz_Extension {
 			$this->store()->deleteTopic($topicId);
 			$this->syntheticFeedIds = null;
 		} elseif ($action === 'test') {
-			// Test the saved preference, not any automatic cloud-cooldown fallback, so this always reflects the
-			// profile the user is actually looking at.
-			$config = $this->configuration();
-			$tested = $this->ollamaProfiles()[$config['ollama_profile']];
-			(new TopicDigestOllama($tested['ollama_url'], $config['timeout']))->test([
-				$tested['summary_model'], $tested['judge_model'], $tested['embedding_model'],
-			]);
-			Minz_Request::good('Ollama connection and models are available.');
+			// Tests the saved preference, not any automatic runtime fallback, so this always reflects the
+			// configuration the user is actually looking at. Each component is tested independently, and all of
+			// them run concurrently (TopicDigestParallelTester), so a broken fallback (or embedding provider) is
+			// never misreported as the primary being broken, and a slow/unreachable endpoint only costs its own
+			// short fixed timeout rather than blocking the others or borrowing the full processing timeout.
+			$timeout = $this->ollamaTimeoutConfiguration();
+			$tester = new TopicDigestParallelTester();
+
+			$primary = $this->primaryTextIdentity();
+			$primaryLabel = $primary['type'] === 'openai-compatible'
+				? 'OpenAI-compatible primary text provider' : "Primary text provider ({$this->storedOllamaProfile()})";
+			$primaryProvider = $this->buildPrimaryTextProvider($timeout, $tester);
+			$labels = [$primaryLabel];
+			$operations = [static fn(): mixed => $primaryProvider->test([$primary['summary_model'], $primary['judge_model']])];
+
+			$fallback = $this->fallbackTextIdentity();
+			$fallbackProvider = $fallback === null ? null : $this->buildFallbackTextProvider($timeout, $tester);
+			if ($fallback !== null && $fallbackProvider !== null) {
+				$labels[] = $fallback['type'] === 'openai-compatible'
+					? 'OpenAI-compatible fallback text provider' : 'Fallback text provider (local Ollama)';
+				$operations[] = static fn(): mixed => $fallbackProvider->test([$fallback['summary_model'], $fallback['judge_model']]);
+			}
+
+			$embeddingModel = $this->embeddingConfiguration()['model'];
+			$embeddingProvider = $this->buildEmbeddingProvider($timeout, $tester);
+			$labels[] = 'Local embedding provider';
+			$operations[] = static fn(): mixed => $embeddingProvider->test([$embeddingModel]);
+
+			$outcomes = $tester->run($operations);
+			$results = [];
+			$ok = true;
+			foreach ($outcomes as $index => $error) {
+				if ($error === null) {
+					$results[] = "{$labels[$index]}: OK";
+				} else {
+					$ok = false;
+					$results[] = "{$labels[$index]}: FAILED ({$error->getMessage()})";
+				}
+			}
+
+			$message = implode(' | ', $results);
+			if ($ok) {
+				Minz_Request::good($message);
+			} else {
+				Minz_Request::bad($message);
+			}
 		} else {
 			throw new InvalidArgumentException('Unknown Topic Digest action.');
 		}
@@ -1391,7 +1797,9 @@ final class TopicDigestExtension extends Minz_Extension {
 			return;
 		}
 		$command = 'nohup ' . escapeshellarg($php) . ' ' . escapeshellarg(__DIR__ . '/cli/daemon.php')
-			. ' --user ' . escapeshellarg($username) . ' >> ' . escapeshellarg($this->getExtensionUserPath() . '/worker.log')
+			. ' --user ' . escapeshellarg($username)
+			. ' --concurrency ' . escapeshellarg((string)$this->workerConcurrency())
+			. ' >> ' . escapeshellarg($this->getExtensionUserPath() . '/worker.log')
 			. ' 2>&1 < /dev/null &';
 		$output = [];
 		$result = 0;

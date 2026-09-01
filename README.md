@@ -64,44 +64,144 @@ match. Neither extension has a runtime dependency on the other.
 When both are enabled, Topic Digest receives each new article first at the
 FreshRSS queue hook, so classification is queued before deduplication.
 
-## Local and Ollama Cloud profiles
+## Provider architecture
 
-The Ollama settings hold two independent profiles, **Local** and **Ollama
-Cloud**, each with its own URL and model names. Switch the active profile
-radio and save to change which one is used; the other profile's settings stay
-saved so you don't have to re-enter them when you switch back. Switching
-profiles reclassifies the embedding cache automatically if the embedding
-model changed.
+Text inference (summaries and topic/event decisions) and embeddings are
+independently configured providers:
 
-When Cloud rejects a request with an account or plan limit (HTTP 402/429), the
-worker uses the local profile for 20 minutes. After that cooldown, the next
-worker batch tries Cloud again automatically; another limit response starts a
-new cooldown. The selected profile remains Cloud throughout, so no manual
-switch back is needed.
+- A **primary text provider**: Local Ollama, Ollama Cloud, or a generic
+  **OpenAI-compatible** chat-completions endpoint (Bearer authentication,
+  `POST {base_url}/chat/completions`) — OpenRouter, Groq, or anything else
+  speaking the same protocol. No provider is assumed by name; only the base
+  URL, API key, and model names are configured.
+- An optional **fallback text provider**, used only while the primary is
+  rejecting requests for account/plan reasons (HTTP 402/429, or a response
+  body that looks like exhausted quota/credits on some other status). It can
+  be Local Ollama (the default, reproducing the original automatic Ollama
+  Cloud → local behaviour, generalized to any non-local primary), an
+  OpenAI-compatible endpoint, or disabled entirely.
+- An **embedding provider**, always Ollama-compatible and fully independent
+  of whichever text provider(s) are configured — an OpenAI-compatible
+  endpoint is never sent embedding requests, since none is required to
+  support them.
 
-Queue bookkeeping follows the profile you selected, not the one temporarily in
-use during an automatic fallback, so a fallback and its recovery never
-invalidate work that is already queued. The trade-off is that summaries and
-embeddings produced while the fallback is active are cached under the selected
-profile's identity; mismatched embedding dimensions are scored as "no
-similarity", so this only blurs which topics get shortlisted for an article,
-never which ones it is actually compared against.
+Each of the three is a separate class behind small `TopicDigestTextProvider`/
+`TopicDigestEmbeddingProvider` interfaces
+(`TopicDigestOllama`, `TopicDigestOpenAICompatible`), assembled per request by
+`TopicDigestTextProviderChain`. `TopicDigestProcessor` only ever talks to
+these abstractions, never to a specific provider's wire format.
 
-Ollama Cloud does not support the JSON schema "format" constraint that
-enforces a structured reply. Every request therefore also states the required
-schema and its exact field names in the prompt, so a cloud model is told what
-shape to produce rather than being expected to guess it; a reply that arrives
-with extra fields is accepted and trimmed, and one missing a required field is
-still rejected. A cloud model may nonetheless answer in plain text or with a
-wrongly shaped object. When it answers in plain text, Topic Digest resends it to a
-model on the local profile's URL (its own structured-output support is
-unaffected) and asks it to extract the same fields. This "structuring model"
-defaults to the local profile's summary model; set an explicit one in
-**Structuring model** if you'd rather use something smaller or faster for
-that recovery step. If both the primary reply and the structuring fallback
-fail, the error on the settings page includes the model name, done_reason,
-and a snippet of the raw reply for troubleshooting, and the full worker log
-is available under **View complete log**.
+## Configuring a primary + fallback
+
+Pick the **primary text provider** (Local Ollama, Ollama Cloud, or
+OpenAI-compatible) and fill in its section; the other sections' settings stay
+saved so switching back later doesn't need re-entering them. Then pick a
+**fallback text provider** — the default, "Local Ollama", is what earlier
+versions did automatically and unconditionally for a Cloud primary.
+
+Example: Ollama Cloud as primary, OpenRouter as fallback, for the free Cloud
+allowance first and a cheap continuation once it's used up:
+
+```text
+Primary text provider:    Ollama Cloud
+    Summary model:        gpt-oss:20b-cloud
+    Decision model:       gpt-oss:20b-cloud
+
+Fallback text provider:   OpenAI-compatible
+    Base URL:             https://openrouter.ai/api/v1
+    API key:              <your OpenRouter key>
+    Summary model:        openai/gpt-oss-20b
+    Decision model:       openai/gpt-oss-20b
+
+Embedding provider:       Local Ollama
+    Embedding model:      qwen3-embedding:0.6b
+```
+
+The same shape works with Groq instead:
+
+```text
+Base URL:  https://api.groq.com/openai/v1
+```
+
+**Keep embeddings local.** An embedding model only needs to run once per
+article and topic description, is much cheaper than text generation, and
+"Local Ollama" is the recommended embedding provider regardless of which text
+provider(s) you use for summaries and decisions.
+
+## Quota fallback behaviour
+
+When the primary rejects a request for account/plan reasons, the worker uses
+the fallback for about 20 minutes, then automatically tries the primary again;
+another limit response starts a new cooldown. **The saved primary provider
+never changes** — this is purely a temporary, automatic substitution, visible
+on the settings page as "Effective text provider" and "Fallback active
+until".
+
+A temporary fallback, by itself, never requeues or invalidates the processing
+backlog, and articles already summarised/embedded before the fallback started
+are reused as-is once the fallback (or the primary again, after recovery)
+picks up the queue — only the article that hasn't reached that stage yet
+actually calls the model. Changing a provider's *configuration* (its model
+name, its URL) is a different, deliberate action, and does invalidate
+whatever depended on the old value, exactly as changing a single Ollama
+profile's model always has.
+
+Ollama Cloud, and many OpenAI-compatible endpoints, don't fully support (or
+don't support at all) a JSON-schema-constrained reply. Every request therefore
+also states the required schema and its exact field names in the prompt, so a
+model is told what shape to produce rather than being expected to guess it; a
+reply that arrives with extra fields is accepted and trimmed, and one missing
+a required field is still rejected. The OpenAI-compatible provider prefers
+native `response_format: {"type": "json_schema", ...}` when it works, and
+also sends `reasoning_effort: "low"` to cap hidden reasoning-token usage on
+reasoning-capable models (e.g. `gpt-oss`, `gpt-5-nano`); it retries once
+without both if the endpoint rejects that request shape outright, and
+separately retries once with a much larger token budget if a reasoning
+model still spends its whole budget reasoning and emits no visible content.
+A model may nonetheless answer
+in plain text or with a wrongly shaped object;
+when it does, Topic Digest resends it to a model on the local Ollama profile's
+URL (its own structured-output support is unaffected) and asks it to extract
+the same fields. This "structuring model" defaults to the local profile's
+summary model; set an explicit one in **Structuring model** if you'd rather
+use something smaller or faster for that recovery step. If both the primary
+reply and the structuring fallback fail, the error on the settings page
+includes the provider, model name, HTTP status, and a snippet of the raw
+reply for troubleshooting (never the API key), and the full worker log is
+available under **View complete log**.
+
+## API key security
+
+An OpenAI-compatible API key is stored with your other Topic Digest settings
+(the same per-user configuration FreshRSS already uses for this extension —
+treat it with the same care as your FreshRSS login). It is never logged,
+never included in an error message, never sent to your browser once saved,
+and never appears on the status page: the settings field is always rendered
+blank, and a blank submission means "keep the saved key unchanged" — use the
+"Clear the saved API key" checkbox to actually remove it.
+
+## Provider/model changes and cached results
+
+Summaries, embeddings, and topic/event decisions are all cached, keyed
+(among other things) on which provider and model actually produced them. It
+does **not** matter which provider happens to be effective at any given
+moment (primary or a temporary fallback): that distinction only ever affects
+*which* provider is asked to do new work, never whether already-cached work
+is considered valid.
+
+Changing the **summary or embedding model** (either provider's, or the
+embedding provider's) restarts the digest: it unmatches already-matched
+articles and reclassifies the whole backlog against the new value, the same
+behaviour a single-profile setup always had, because the summaries and
+embeddings those matches were based on are no longer trustworthy.
+
+Changing only the **judge model** does not restart the digest. Topic and
+event decisions are cached against the judge model that produced them, so a
+change is picked up automatically the next time a decision is actually
+needed — a new article, a new candidate event — without redoing every
+decision already made. If you want to deliberately re-judge already-matched
+articles against a new judge model, restart the digest manually from its
+settings page.
 
 ## Topic presentations
 
@@ -317,6 +417,52 @@ already done or never needed an LLM call. If processing speed still seems
 concerning, check the recent-errors list and failed count rather than the
 throughput number alone, and — on the Cloud profile — keep an eye on your
 usage quota, since sustained high throughput consumes it faster.
+
+## Worker concurrency
+
+**Batch size** and **concurrency** are different settings. Batch size
+(`--batch`/`--limit`) is how many articles the worker considers in one run.
+**Worker concurrency** (1-8, default **1**) is how many of those articles may
+have text inference (summarization, topic judging) in flight *at the same
+time*. The default reproduces the original, fully sequential worker exactly —
+nothing changes until this is raised.
+
+**It only ever applies to an OpenAI-compatible endpoint.** Whether the
+effective text provider is local Ollama or Ollama Cloud, the setting is
+silently ignored and processing stays fully sequential, one article at a
+time, regardless of its value. Ollama is a single server process without an
+OpenAI-compatible API's multi-tenant concurrent-request handling, and this
+project's own recommended models already target modest CPU/GPU hardware —
+asking it to run several articles' inference at once would add queuing and
+contention at best and risk starving or exhausting memory on a constrained
+host at worst, for no real throughput gain. Embeddings, which always go to
+Ollama regardless of which text provider is configured, are likewise never
+sent concurrently, even while text inference to an OpenAI-compatible endpoint
+is running concurrently for the same batch.
+
+With an OpenAI-compatible primary or fallback in effect, **4** is a
+reasonable starting point, and **8** is worth trying only if the provider's
+own rate limits and this host's resources comfortably allow it.
+
+Concurrency only ever overlaps the *inference* stage between articles.
+Everything that mutates shared state for event grouping — deciding whether an
+article starts a new event or joins an existing one, source membership,
+generated-feed synchronization, and read/unread marking — always commits one
+article at a time, never concurrently, specifically so that two articles about
+the same real-world event can never race into creating two separate events.
+
+Set it on the settings page, or override it per invocation:
+
+```sh
+php /var/www/FreshRSS/extensions/xExtension-TopicDigest/cli/daemon.php \
+	--user alice --batch 20 --concurrency 4
+php /var/www/FreshRSS/extensions/xExtension-TopicDigest/cli/process.php \
+	--user alice --limit 20 --concurrency 4
+```
+
+`--batch`/`--limit` keep their existing meaning exactly (up to that many
+articles total for the invocation); `--concurrency` only bounds how many of
+them may be worked on simultaneously within that limit.
 
 ## Development and tests
 

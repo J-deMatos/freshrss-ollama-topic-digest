@@ -5,43 +5,68 @@ declare(strict_types=1);
 final class TopicDigestProcessor {
 	private const TOPIC_DECISION_REVISION = 'topic-batch-v2';
 	private const EVENT_DECISION_REVISION = 'event-batch-v1';
-	/** How long to skip Ollama Cloud after it rejects a request for account/plan reasons (HTTP 402/429). */
-	private const CLOUD_COOLDOWN_SECONDS = 1200;
+	/** How long to skip a primary text provider after it rejects a request for account/plan reasons (HTTP 402/429). */
+	private const FALLBACK_COOLDOWN_SECONDS = 1200;
 	private TopicDigestStore $store;
 	/** @var TopicDigestConfig */
 	private array $config;
-	private TopicDigestOllama $ollama;
+	/**
+	 * The real, always-blocking-curl text chain, used by finalize() and by the sequential (concurrency=1)
+	 * path. runConcurrent() temporarily swaps this for a wavefront-scoped, dispatcher-routed chain while its
+	 * prepare() fibers run, then restores it — see runConcurrent()'s doc comment for why that swap is safe.
+	 */
+	private TopicDigestTextProviderChain $chain;
+	/**
+	 * Always real-blocking curl, never dispatcher-routed, even during a concurrent wavefront: embeddings
+	 * always go to Ollama, and Ollama is not what worker concurrency is meant for (see runActive()). A
+	 * blocking call inside one prepare() fiber blocks the whole process until it returns, which keeps
+	 * embedding calls serialized by construction rather than by a separate check.
+	 */
+	private TopicDigestEmbeddingProvider $embeddingProvider;
+	private string $embeddingModel;
+	/**
+	 * How many articles' prepare() stage may run concurrently against an OpenAI-compatible endpoint; 1
+	 * reproduces the original sequential worker. Has no effect while the effective text provider is Ollama
+	 * (local or cloud) — see runActive()'s $effectiveConcurrency.
+	 */
+	private int $concurrency;
 
-	public function __construct(private readonly TopicDigestExtension $extension) {
+	/** @param ?int $concurrencyOverride When given (e.g. from a CLI --concurrency flag), used instead of the configured worker_concurrency. */
+	public function __construct(private readonly TopicDigestExtension $extension, ?int $concurrencyOverride = null) {
 		$this->store = $extension->store();
 		$this->config = $extension->configuration();
-		$this->ollama = new TopicDigestOllama((string)$this->config['ollama_url'], (int)$this->config['timeout'],
-			structuringUrl: (string)$extension->ollamaProfiles()['local']['ollama_url'],
-			structuringModel: (string)$this->config['structuring_model']);
-		// Keyed on the *stored* profile, never the effective one: the automatic cloud->local fallback flips on its
-		// own every cooldown, and invalidating every embedding on each flip meant they were permanently being
-		// recomputed rather than used. A temporary fallback may therefore leave embeddings from two models in the
-		// cache; cosine() already scores mismatched dimensions as -1, so that only blurs candidate ranking.
-		$storedProfile = (string)$this->config['ollama_profile'];
-		if ($this->store->lastOllamaProfile() !== $storedProfile) {
+		$timeout = (int)$this->config['timeout'];
+		$this->chain = $extension->textProviderChain($timeout);
+		$this->embeddingProvider = $extension->buildEmbeddingProvider($timeout);
+		$this->embeddingModel = (string)$this->config['embedding_provider_model'];
+		$this->concurrency = $concurrencyOverride !== null ? max(1, min(8, $concurrencyOverride)) : $extension->workerConcurrency();
+		// Keyed on the embedding provider's own identity, never any text-provider setting: a temporary
+		// text-provider fallback flips on its own every cooldown, and invalidating every embedding on each flip
+		// meant they were permanently being recomputed rather than used. A genuine embedding model/endpoint change
+		// is what should invalidate them, and only that, now that embeddings are fully decoupled from text
+		// providers. A change may therefore leave embeddings from two models in the cache; cosine() already scores
+		// mismatched dimensions as -1, so that only blurs candidate ranking.
+		$embeddingIdentity = $extension->embeddingIdentityHash();
+		if ($this->store->lastEmbeddingIdentity() !== $embeddingIdentity) {
 			$this->store->invalidateEmbeddings();
-			$this->store->setLastOllamaProfile($storedProfile);
+			$this->store->setLastEmbeddingIdentity($embeddingIdentity);
 		}
 	}
 
-	/** @return array{processed:int,failed:int,backfill_scanned:int} */
+	/** @return array{processed:int,failed:int,backfill_scanned:int,claimed:int} */
 	public function run(int $limit): array {
 		if ($this->store->isPaused()) {
-			return ['processed' => 0, 'failed' => 0, 'backfill_scanned' => 0];
+			return ['processed' => 0, 'failed' => 0, 'backfill_scanned' => 0, 'claimed' => 0];
 		}
 		return $this->runActive($limit);
 	}
 
-	/** @return array{processed:int,failed:int,backfill_scanned:int} */
+	/** @return array{processed:int,failed:int,backfill_scanned:int,claimed:int} */
 	private function runActive(int $limit): array {
 		$processed = 0;
 		$failed = 0;
 		$scanned = 0;
+		$claimed = 0;
 		// Enqueue the whole remaining archive up front (not paced against the current queue depth) so
 		// "queued" reflects the true amount of outstanding work, making the processing-time estimate meaningful
 		// from the start instead of growing as backfill trickles more items in over time.
@@ -55,40 +80,188 @@ final class TopicDigestProcessor {
 			}
 		}
 		if ($this->store->isPaused()) {
-			return ['processed' => 0, 'failed' => 0, 'backfill_scanned' => $scanned];
+			return ['processed' => 0, 'failed' => 0, 'backfill_scanned' => $scanned, 'claimed' => 0];
 		}
-		for ($index = 0; $index < $limit; $index++) {
+		// Concurrent dispatch is only used against an OpenAI-compatible endpoint. Local and Ollama Cloud are
+		// both a single Ollama server process, generally sized (per this project's own recommendations) for
+		// one request at a time on modest CPU/GPU hardware — Ollama has no equivalent of an OpenAI-compatible
+		// API's multi-tenant concurrent-request handling, so asking it to do several articles' inference at
+		// once would add contention and queuing at best, and risks starving/OOM-ing a memory-constrained host
+		// at worst, for no real throughput gain. worker_concurrency is silently clamped to 1 (fully sequential,
+		// identical to the original worker) whenever the effective text provider isn't 'openai-compatible',
+		// regardless of the configured value.
+		$effectiveConcurrency = $this->chain->providerType() === 'openai-compatible' ? $this->concurrency : 1;
+		// Bounded by jobs actually claimed, not by how many of them end up processed/failed: a job that turns
+		// out stale and gets silently requeued (process()/finalize() returning false without throwing) counts
+		// as one consumed attempt here, exactly as one loop iteration did in the original per-job for-loop —
+		// it must not let this call claim more than $limit jobs in total, nor stop before $limit is reached
+		// just because one wavefront's jobs all happened to requeue rather than complete.
+		$remaining = $limit;
+		while ($remaining > 0) {
+			$jobs = $this->claimWavefront(min($effectiveConcurrency, $remaining));
+			if ($jobs === []) {
+				break;
+			}
+			$remaining -= count($jobs);
+			$claimed += count($jobs);
+			$outcome = count($jobs) === 1 ? $this->runSequential($jobs) : $this->runConcurrent($jobs);
+			$processed += $outcome['processed'];
+			$failed += $outcome['failed'];
+		}
+		return ['processed' => $processed, 'failed' => $failed, 'backfill_scanned' => $scanned, 'claimed' => $claimed];
+	}
+
+	/**
+	 * Claims up to $size jobs by calling the existing (already concurrency-safe: BEGIN IMMEDIATE per call)
+	 * claim() that many times in sequence, rather than adding a new bulk-claim store method — claim() is only
+	 * ever called from this one, single-threaded loop, so calling it repeatedly is exactly as safe as calling
+	 * it once. May return fewer than $size jobs (or none) if the queue runs out.
+	 *
+	 * @return list<array<string,mixed>>
+	 */
+	private function claimWavefront(int $size): array {
+		$jobs = [];
+		for ($i = 0; $i < $size; $i++) {
 			$job = $this->store->claim(max(600, (int)$this->config['timeout'] * 10));
 			if ($job === null) {
 				break;
 			}
+			$jobs[] = $job;
+		}
+		return $jobs;
+	}
+
+	/** @param list<array<string,mixed>> $jobs @return array{processed:int,failed:int} */
+	private function runSequential(array $jobs): array {
+		$processed = 0;
+		$failed = 0;
+		foreach ($jobs as $job) {
 			$jobStartedAt = hrtime(true);
 			try {
 				if ($this->process($job)) {
 					$processed++;
-					try {
-						if (!$this->store->recordProcessingActivity((string)$job['entry_id'],
-								(hrtime(true) - $jobStartedAt) / 1_000_000_000)) {
-							Minz_Log::error('Topic Digest could not attach processing metrics to the completed job.');
-						}
-					} catch (Throwable $e) {
-						Minz_Log::error('Topic Digest processing metrics error: ' . $e->getMessage());
-					}
+					$this->recordActivity($job, $jobStartedAt);
 				}
 			} catch (Throwable $e) {
-				if ($e instanceof OllamaQuotaExceededException && (string)$this->config['ollama_profile'] === 'cloud') {
-					$this->store->markCloudUnavailable(time() + self::CLOUD_COOLDOWN_SECONDS);
-					Minz_Log::error('Topic Digest: Ollama Cloud usage limit reached, falling back to the local '
-						. 'profile for ' . self::CLOUD_COOLDOWN_SECONDS . ' seconds: ' . $e->getMessage());
-				}
-				if ($this->store->failCurrent($job, $e->getMessage())) {
+				if ($this->handleFailure($job, $e, $this->chain)) {
 					$failed++;
-					Minz_Log::error('Topic Digest worker error: ' . $e->getMessage());
-					$this->releaseRebuildRestoreIfAbandoned($job);
 				}
 			}
 		}
-		return ['processed' => $processed, 'failed' => $failed, 'backfill_scanned' => $scanned];
+		return ['processed' => $processed, 'failed' => $failed];
+	}
+
+	/**
+	 * Runs prepare() for every claimed job concurrently via a fresh TopicDigestConcurrentDispatcher (one
+	 * shared curl_multi handle, one Fiber per job), then finalize()s each result one at a time in a plain
+	 * sequential loop — finalize() is where event/source/feed state is read and written, and nothing else
+	 * ever touches those tables, so running it strictly one job at a time (never inside a Fiber) is exactly
+	 * as safe as today's fully sequential worker was.
+	 *
+	 * Only reached when the effective text provider is 'openai-compatible' (see runActive()'s
+	 * $effectiveConcurrency): $this->chain is temporarily pointed at a wavefront-scoped, dispatcher-routed
+	 * chain for the duration of the concurrent prepare() calls, then restored. This is safe despite being
+	 * shared mutable state because PHP Fibers are cooperative: the reassignment itself never spans a
+	 * Fiber::suspend() point, so every prepare() fiber sees the wavefront chain for its entire run, and
+	 * finalize() (called only after every fiber has terminated and the original is restored) never sees it.
+	 *
+	 * $this->embeddingProvider is deliberately left untouched — embeddings always go to Ollama regardless of
+	 * which text provider is in use, and Ollama is not what concurrency is meant for here (see runActive()).
+	 * Leaving it real-blocking means an embedding call inside one prepare() fiber blocks the whole PHP process
+	 * (fibers are cooperative, not real threads) until it returns, so embedding calls are never actually
+	 * concurrent even during an active wavefront — only the dispatcher-routed OpenAI-compatible calls are.
+	 *
+	 * @param list<array<string,mixed>> $jobs @return array{processed:int,failed:int}
+	 */
+	private function runConcurrent(array $jobs): array {
+		$timeout = (int)$this->config['timeout'];
+		$dispatcher = new TopicDigestConcurrentDispatcher(min(30, max(5, $timeout)), $timeout);
+		$wavefrontChain = $this->extension->textProviderChain($timeout, $dispatcher);
+		$originalChain = $this->chain;
+		$this->chain = $wavefrontChain;
+		$startedAt = [];
+		try {
+			$operations = [];
+			foreach ($jobs as $index => $job) {
+				$startedAt[$index] = hrtime(true);
+				$operations[] = fn(): array => $this->prepare($job);
+			}
+			$results = $dispatcher->run($operations);
+		} finally {
+			$this->chain = $originalChain;
+		}
+		$processed = 0;
+		$failed = 0;
+		$quotaExceeded = false;
+		foreach ($results as $index => $outcome) {
+			$job = $jobs[$index];
+			if ($outcome['error'] !== null) {
+				if ($outcome['error'] instanceof OllamaQuotaExceededException) {
+					$quotaExceeded = true;
+				}
+				if ($this->handleFailure($job, $outcome['error'], $wavefrontChain, logCooldown: false)) {
+					$failed++;
+				}
+				continue;
+			}
+			try {
+				if ($this->finalize($outcome['value'])) {
+					$processed++;
+					$this->recordActivity($job, $startedAt[$index]);
+				}
+			} catch (Throwable $e) {
+				if ($e instanceof OllamaQuotaExceededException) {
+					$quotaExceeded = true;
+				}
+				if ($this->handleFailure($job, $e, $wavefrontChain, logCooldown: false)) {
+					$failed++;
+				}
+			}
+		}
+		// One cooldown write for the whole wavefront rather than one per quota-exceeded article: the underlying
+		// meta write is an idempotent last-write-wins upsert either way, so this is a cleanliness measure, not a
+		// correctness requirement. Checked against the wavefront's own chain, which is the one that actually
+		// made the failing calls.
+		if ($quotaExceeded && $wavefrontChain->hasFallback() && !$wavefrontChain->usesFallback()) {
+			$this->extension->markPrimaryTextUnavailable(time() + self::FALLBACK_COOLDOWN_SECONDS);
+			Minz_Log::error('Topic Digest: the primary text provider hit an account/plan limit during a concurrent '
+				. 'wavefront, falling back for ' . self::FALLBACK_COOLDOWN_SECONDS . ' seconds.');
+		}
+		return ['processed' => $processed, 'failed' => $failed];
+	}
+
+	/** @param array<string,mixed> $job */
+	private function recordActivity(array $job, int $jobStartedAt): void {
+		try {
+			if (!$this->store->recordProcessingActivity((string)$job['entry_id'],
+					(hrtime(true) - $jobStartedAt) / 1_000_000_000)) {
+				Minz_Log::error('Topic Digest could not attach processing metrics to the completed job.');
+			}
+		} catch (Throwable $e) {
+			Minz_Log::error('Topic Digest processing metrics error: ' . $e->getMessage());
+		}
+	}
+
+	/**
+	 * @param array<string,mixed> $job
+	 * Only the primary hitting a quota/rate limit starts a cooldown: this mirrors the exact timing of the
+	 * original Ollama Cloud->local mechanism (no mid-job retry through the fallback — the *next*
+	 * TopicDigestProcessor construction, or in the concurrent case the rest of this wavefront's finalize loop,
+	 * is what starts using it, once the cooldown is recorded). $logCooldown lets runConcurrent() suppress the
+	 * per-job cooldown write and do it once for the whole wavefront instead.
+	 */
+	private function handleFailure(array $job, Throwable $e, TopicDigestTextProviderChain $chain, bool $logCooldown = true): bool {
+		if ($logCooldown && $e instanceof OllamaQuotaExceededException && $chain->hasFallback() && !$chain->usesFallback()) {
+			$this->extension->markPrimaryTextUnavailable(time() + self::FALLBACK_COOLDOWN_SECONDS);
+			Minz_Log::error('Topic Digest: the primary text provider hit an account/plan limit, falling back '
+				. 'for ' . self::FALLBACK_COOLDOWN_SECONDS . ' seconds: ' . $e->getMessage());
+		}
+		if ($this->store->failCurrent($job, $e->getMessage())) {
+			Minz_Log::error('Topic Digest worker error: ' . $e->getMessage());
+			$this->releaseRebuildRestoreIfAbandoned($job);
+			return true;
+		}
+		return false;
 	}
 
 	/**
@@ -127,9 +300,9 @@ final class TopicDigestProcessor {
 			if ((bool)$this->config['scraping'] && TopicDigestScraper::isInsufficient($entry->content(false))) {
 				$text = TopicDigestScraper::fetch($entry->link(raw: true), min(60, (int)$this->config['timeout'])) ?? $text;
 			}
-			$summary = $this->ollama->summarise((string)$this->config['summary_model'],
+			$summary = $this->chain->provider()->summarise($this->chain->summaryModel(),
 				htmlspecialchars_decode($entry->title(), ENT_QUOTES), $text, $entry->date(true));
-			$decision = $this->ollama->matchTopic((string)$this->config['judge_model'], $summary, $topic);
+			$decision = $this->chain->provider()->matchTopic($this->chain->judgeModel(), $summary, $topic);
 			$results[] = ['title' => htmlspecialchars_decode($entry->title(), ENT_QUOTES),
 				'matches' => $decision['matches'] && $decision['confidence'] >= (float)$topic['confidence'],
 				'confidence' => $decision['confidence'], 'reason' => $decision['reason']];
@@ -139,6 +312,38 @@ final class TopicDigestProcessor {
 
 	/** @param array<string,mixed> $job */
 	private function process(array $job): bool {
+		return $this->finalize($this->prepare($job));
+	}
+
+	/**
+	 * @return array{handled:bool,result:bool,job:array<string,mixed>,entry:?FreshRSS_Entry,stored:?array<string,mixed>,
+	 *     summary:?array<string,mixed>,embedding:?list<float>,candidate_topics:?list<array<string,mixed>>,
+	 *     topic_decisions:?array<int,array{matches:bool,confidence:float,reason:string,event_title:string}>}
+	 */
+	private function handled(bool $result): array {
+		return ['handled' => true, 'result' => $result, 'job' => [], 'entry' => null, 'stored' => null,
+			'summary' => null, 'embedding' => null, 'candidate_topics' => null, 'topic_decisions' => null];
+	}
+
+	/**
+	 * The article-local work safe to run concurrently across several claimed jobs: entry lookup/recovery, the
+	 * cheap skip checks (each already terminal, via handled()), and the expensive per-article inference
+	 * (summary, embedding, per-topic judge decisions). Stops right before event resolution, which reads
+	 * cross-article shared state (`events`) and must never act on a value read before a network call
+	 * suspended this Fiber — that part lives in finalize(), which only ever runs one job at a time.
+	 *
+	 * Safe to run inside a Fiber even though several of its early-exit branches write to the database
+	 * (queue/source-membership bookkeeping, generated-feed sync): none of them, nor anything else in this
+	 * method before the inference calls, ever makes an HTTP call, so nothing here can be interleaved with
+	 * another concurrently-running Fiber's code — PHP Fibers only ever switch at a Fiber::suspend() point,
+	 * which only occurs inside a provider call routed through TopicDigestConcurrentDispatcher.
+	 *
+	 * @param array<string,mixed> $job
+	 * @return array{handled:bool,result:bool,job:array<string,mixed>,entry:?FreshRSS_Entry,stored:?array<string,mixed>,
+	 *     summary:?array<string,mixed>,embedding:?list<float>,candidate_topics:?list<array<string,mixed>>,
+	 *     topic_decisions:?array<int,array{matches:bool,confidence:float,reason:string,event_title:string}>}
+	 */
+	private function prepare(array $job): array {
 		$entry = FreshRSS_Factory::createEntryDao()->searchById((string)$job['entry_id']);
 		if ($entry === null) {
 			$entry = $this->recoverEntryByGuid($job);
@@ -153,12 +358,12 @@ final class TopicDigestProcessor {
 			// were recorded are in that state, and the article itself, if it still exists, is queued again under
 			// its current id by the archive scan, so say so rather than reporting a deletion that may not have
 			// happened.
-			return (string)($job['guid'] ?? '') === ''
+			return $this->handled((string)($job['guid'] ?? '') === ''
 				? $this->store->discardStaleCurrent($job)
-				: $this->store->completeCurrent($job, 'skipped', 'Entry no longer exists.');
+				: $this->store->completeCurrent($job, 'skipped', 'Entry no longer exists.'));
 		}
 		if ($this->extension->isSyntheticFeed($entry->feedId())) {
-			return $this->store->completeCurrent($job, 'skipped', 'Synthetic digest entry.');
+			return $this->handled($this->store->completeCurrent($job, 'skipped', 'Synthetic digest entry.'));
 		}
 		if (!hash_equals((string)$job['content_hash'], $entry->hash())
 				|| !hash_equals((string)$job['pipeline_hash'], $this->extension->pipelineHash())) {
@@ -170,7 +375,7 @@ final class TopicDigestProcessor {
 					archive: (bool)($job['is_archive'] ?? false))) {
 				$this->store->releaseCurrent($job);
 			}
-			return false;
+			return $this->handled(false);
 		}
 		foreach ($this->store->detachChangedSources($entry->id(), $entry->hash()) as $topicId) {
 			if ($this->store->topic($topicId) !== null) {
@@ -187,15 +392,15 @@ final class TopicDigestProcessor {
 		}
 		if ($entry->isFavorite() || $this->store->isProtected($entry->id())) {
 			$this->extension->finishRebuildForEntry($entry, false);
-			return $this->store->completeCurrent($job, 'skipped', 'Article is protected by the user.');
+			return $this->handled($this->store->completeCurrent($job, 'skipped', 'Article is protected by the user.'));
 		}
 		if ($this->extension->isFilterReadEntry($entry)) {
 			$this->extension->finishRebuildForEntry($entry, false);
-			return $this->store->completeCurrent($job, 'skipped', 'Marked read by a FreshRSS filter.');
+			return $this->handled($this->store->completeCurrent($job, 'skipped', 'Marked read by a FreshRSS filter.'));
 		}
 		if (!$this->hasEligibleTopic($job)) {
 			$this->extension->finishRebuildForEntry($entry, false);
-			return $this->store->completeCurrent($job, 'skipped', 'No active topic includes this article.');
+			return $this->handled($this->store->completeCurrent($job, 'skipped', 'No active topic includes this article.'));
 		}
 
 		$stored = $this->store->summary($entry->id());
@@ -218,14 +423,14 @@ final class TopicDigestProcessor {
 				if ((bool)$this->config['scraping'] && TopicDigestScraper::isInsufficient((string)$job['rss_text'])) {
 					$text = TopicDigestScraper::fetch((string)$job['link'], min(60, (int)$this->config['timeout'])) ?? $text;
 				}
-				$summary = $this->ollama->summarise((string)$this->config['summary_model'],
+				$summary = $this->chain->provider()->summarise($this->chain->summaryModel(),
 					(string)$job['title'], $text, (int)$job['published_at']);
-				$embedding = $this->ollama->embed((string)$this->config['embedding_model'], $this->summaryText($summary));
+				$embedding = $this->embeddingProvider->embed($this->embeddingModel, $this->summaryText($summary));
 			}
 			$feedName = htmlspecialchars_decode($entry->feed()?->name(raw: true) ?? '', ENT_QUOTES);
 			if (!$this->store->saveSummaryIfCurrent($job, $this->extension->analysisHash(), $feedName,
 					json_encode($summary, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR), $text, $embedding)) {
-				return false;
+				return $this->handled(false);
 			}
 			if ($shared === null) {
 				$this->publishSharedSummary($job, $summary, $text, $embedding);
@@ -240,13 +445,40 @@ final class TopicDigestProcessor {
 			throw new RuntimeException('Stored Topic Digest summary is invalid.');
 		}
 		$embedding = $this->decodeEmbedding((string)$stored['embedding']);
-		$matched = false;
 		$candidateTopics = array_values(array_filter($this->candidateTopics($job, $embedding),
 			fn(array $topic): bool => !$this->store->isRejected((int)$topic['id'], $entry->id())));
 		$topicDecisions = $this->topicDecisions($job, $summary, $candidateTopics);
 		if ($topicDecisions === null) {
-			return false;
+			return $this->handled(false);
 		}
+		return ['handled' => false, 'result' => false, 'job' => $job, 'entry' => $entry, 'stored' => $stored,
+			'summary' => $summary, 'embedding' => $embedding, 'candidate_topics' => $candidateTopics,
+			'topic_decisions' => $topicDecisions];
+	}
+
+	/**
+	 * Everything that reads or writes cross-article shared state — event candidates, source membership for a
+	 * matched topic, generated-feed synchronization, read-marking — plus the terminal queue write. Always
+	 * called strictly one job at a time (from runSequential()'s plain loop, or after every prepare() Fiber in
+	 * a wavefront has already terminated in runConcurrent()), so re-reading `events`/rejections here fresh is
+	 * exactly as safe as it always was in the fully sequential worker: nothing else ever writes those tables.
+	 *
+	 * @param array{handled:bool,result:bool,job:array<string,mixed>,entry:?FreshRSS_Entry,stored:?array<string,mixed>,
+	 *     summary:?array<string,mixed>,embedding:?list<float>,candidate_topics:?list<array<string,mixed>>,
+	 *     topic_decisions:?array<int,array{matches:bool,confidence:float,reason:string,event_title:string}>} $prepared
+	 */
+	private function finalize(array $prepared): bool {
+		if ($prepared['handled']) {
+			return $prepared['result'];
+		}
+		$job = $prepared['job'];
+		$entry = $prepared['entry'];
+		$stored = $prepared['stored'];
+		$summary = $prepared['summary'];
+		$embedding = $prepared['embedding'];
+		$candidateTopics = $prepared['candidate_topics'];
+		$topicDecisions = $prepared['topic_decisions'];
+		$matched = false;
 		foreach ($candidateTopics as $topic) {
 			if ($this->store->isRejected((int)$topic['id'], $entry->id())) {
 				continue;
@@ -383,8 +615,10 @@ final class TopicDigestProcessor {
 	 * @return array<int,array{matches:bool,confidence:float,reason:string,event_title:string}>|null
 	 */
 	private function topicDecisions(array $job, array $summary, array $topics): ?array {
-		$judgeModel = (string)$this->config['judge_model'];
-		$judgeRevision = $judgeModel . "\n" . self::TOPIC_DECISION_REVISION;
+		$judgeModel = $this->chain->judgeModel();
+		// Qualified by which provider produced it (see judgeModelIdentity()), so a fallback provider that shares a
+		// bare model name with the primary never collides with it in this cache.
+		$judgeRevision = $this->chain->judgeModelIdentity() . "\n" . self::TOPIC_DECISION_REVISION;
 		$inputHash = $this->decisionInputHash($job, $summary);
 		$decisions = [];
 		$uncached = [];
@@ -399,7 +633,7 @@ final class TopicDigestProcessor {
 			}
 		}
 		foreach (array_chunk($uncached, 8) as $batch) {
-			$batchDecisions = $this->ollama->matchTopics($judgeModel, $summary, $batch);
+			$batchDecisions = $this->chain->provider()->matchTopics($judgeModel, $summary, $batch);
 			if (!$this->store->isCurrentJob($job)) {
 				return null;
 			}
@@ -445,7 +679,7 @@ final class TopicDigestProcessor {
 			return $this->decodeEmbedding($stored);
 		}
 		$text = (string)$topic['description'] . "\nExclusions: " . implode('; ', $topic['exclusions']);
-		$embedding = $this->ollama->embed((string)$this->config['embedding_model'], $text);
+		$embedding = $this->embeddingProvider->embed($this->embeddingModel, $text);
 		$this->store->saveTopicEmbedding((int)$topic['id'], (string)$topic['rule_hash'], $embedding);
 		return $embedding;
 	}
@@ -535,8 +769,8 @@ final class TopicDigestProcessor {
 	 * @return array<string,array{same_event:bool,confidence:float,reason:string}>|null
 	 */
 	private function eventDecisions(int $topicId, array $job, array $summary, array $candidates): ?array {
-		$judgeModel = (string)$this->config['judge_model'];
-		$judgeRevision = $judgeModel . "\n" . self::EVENT_DECISION_REVISION;
+		$judgeModel = $this->chain->judgeModel();
+		$judgeRevision = $this->chain->judgeModelIdentity() . "\n" . self::EVENT_DECISION_REVISION;
 		$inputHash = $this->decisionInputHash($job, $summary);
 		$decisions = [];
 		$uncached = [];
@@ -551,7 +785,7 @@ final class TopicDigestProcessor {
 			}
 		}
 		foreach (array_chunk($uncached, 10) as $batch) {
-			$batchDecisions = $this->ollama->sameEvents($judgeModel, $summary, $batch);
+			$batchDecisions = $this->chain->provider()->sameEvents($judgeModel, $summary, $batch);
 			if (!$this->store->isCurrentJob($job)) {
 				return null;
 			}
@@ -589,8 +823,7 @@ final class TopicDigestProcessor {
 	private function sharedSummary(array $job): ?array {
 		try {
 			return $this->extension->sharedSummaryCache()->find(
-				(string)$job['entry_id'], (string)$job['content_hash'], (string)$this->config['summary_model'],
-				(string)$this->config['embedding_model']
+				(string)$job['entry_id'], (string)$job['content_hash'], $this->chain->summaryModel(), $this->embeddingModel
 			);
 		} catch (Throwable $e) {
 			Minz_Log::error('Topic Digest shared-summary read error: ' . $e->getMessage());
@@ -602,8 +835,8 @@ final class TopicDigestProcessor {
 	private function publishSharedSummary(array $job, array $summary, string $sourceText, array $embedding): void {
 		try {
 			$this->extension->sharedSummaryCache()->save(
-				(string)$job['entry_id'], (string)$job['content_hash'], (string)$this->config['summary_model'],
-				(string)$this->config['embedding_model'], $this->summaryText($summary), $sourceText, $embedding,
+				(string)$job['entry_id'], (string)$job['content_hash'], $this->chain->summaryModel(),
+				$this->embeddingModel, $this->summaryText($summary), $sourceText, $embedding,
 				(string)$summary['event_title'], (string)$summary['event_date'], 'topic_digest'
 			);
 		} catch (Throwable $e) {

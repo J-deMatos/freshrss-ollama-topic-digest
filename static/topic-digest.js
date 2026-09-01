@@ -116,13 +116,21 @@
 		topicType?.addEventListener('change', updateVerification);
 		updateVerification();
 		const profileRadios = document.querySelectorAll('[data-ollama-profile-radio]');
+		const fallbackModeRadios = document.querySelectorAll('[data-fallback-mode-radio]');
 		const updateProfile = () => {
 			const selected = document.querySelector('[data-ollama-profile-radio]:checked')?.value;
+			const fallbackSelected = document.querySelector('[data-fallback-mode-radio]:checked')?.value;
 			for (const fieldset of document.querySelectorAll('[data-ollama-profile-fields]')) {
-				fieldset.hidden = fieldset.dataset.ollamaProfileFields !== selected;
+				const target = fieldset.dataset.ollamaProfileFields;
+				// The OpenAI-compatible fieldset is one shared field set usable as the primary and/or the
+				// fallback, so it stays visible whenever either role selects it.
+				fieldset.hidden = fieldset.dataset.openaiFields === '1'
+					? target !== selected && target !== fallbackSelected
+					: target !== selected;
 			}
 		};
 		for (const radio of profileRadios) radio.addEventListener('change', updateProfile);
+		for (const radio of fallbackModeRadios) radio.addEventListener('change', updateProfile);
 		updateProfile();
 	};
 	document.addEventListener('freshrss:globalContextLoaded', configureCategoryLink, {once: true});
